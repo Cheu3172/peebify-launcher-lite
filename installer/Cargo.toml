@@ -1,0 +1,56 @@
+[package]
+name = "peebify-installer"
+version = "0.1.0"
+description = "Peebify Launcher Setup (installer / uninstaller)"
+authors = ["Peebify"]
+license = "GPL-3.0-only"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "peebify-installer"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.16"
+
+tar = "0.4"
+zstd = "0.13"
+sha2 = "0.10"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+
+ureq = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Variant",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-winres = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

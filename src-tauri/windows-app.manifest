@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Replaces tauri-build's default manifest. That default carries the Common-Controls
+  dependency and nothing else, so it is repeated verbatim below; the reason this file
+  exists is longPathAware.
+
+  Without it the launcher is capped at MAX_PATH no matter what the machine's
+  LongPathsEnabled registry value says, because Windows only honours that value for a
+  process whose manifest opts in. Game trees go deeper than 260 characters, and a
+  download that lands a file we then cannot checksum or replace reads to the player as
+  a repair that never finishes.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings xmlns:ws2016="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+      <ws2016:longPathAware>true</ws2016:longPathAware>
+    </windowsSettings>
+  </application>
+</assembly>

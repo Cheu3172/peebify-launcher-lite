@@ -1,0 +1,23 @@
+# Tauri / Cargo (workspace: target + lockfile live at the root now)
+/target
+/src-tauri/target
+/src-tauri/gen
+
+# Build outputs (build-installer.js + Vite)
+/dist
+/webui/dist
+*.tsbuildinfo
+
+# Node / npm
+/node_modules
+/webui/node_modules
+npm-debug.log*
+
+# Stray local build/compiler logs
+/build.log
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

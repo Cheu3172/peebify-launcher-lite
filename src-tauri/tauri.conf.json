@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Peebify Launcher",
+  "version": "4.9.7",
+  "identifier": "com.peebify.launcher",
+  "build": {
+    "frontendDist": "../webui/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm --prefix webui run dev",
+    "beforeBuildCommand": "npm --prefix webui run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Peebify Launcher",
+        "width": 1280,
+        "height": 720,
+        "minWidth": 940,
+        "minHeight": 560,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "backgroundColor": "#00000000",
+        "resizable": true,
+        "fullscreen": false,
+        "visible": false,
+        "skipTaskbar": false,
+        "alwaysOnTop": false,
+        "center": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion,IntensiveWakeUpThrottling --disable-backgrounding-occluded-windows --disable-background-timer-throttling --disable-renderer-backgrounding"
+      }
+    ],
+    "withGlobalTauri": false,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' asset: http://asset.localhost https: data: blob:; media-src 'self' asset: http://asset.localhost https: blob:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; frame-src 'none'; worker-src 'self' blob:; base-uri 'self'; form-action 'none'; frame-ancestors 'none'",
+      "freezePrototype": true,
+      "assetProtocol": {
+        "enable": true,
+        "scope": {
+          "allow": [
+            "$DATA/Peebify Launcher/wallpaper-cache/**",
+            "$VIDEO/Peebify/**"
+          ],
+          "deny": [
+            "$DATA/Peebify Launcher/launcher-config.json",
+            "$DATA/Peebify Launcher/launcher-config.json.*",
+            "$DATA/Peebify Launcher/api-config-cache.json",
+            "$DATA/Peebify Launcher/api-config-cache.json.*",
+            "$DATA/Peebify Launcher/logs/**",
+            "$DATA/Peebify Launcher/mods/library.json",
+            "$DATA/Peebify Launcher/mods/library.json.*",
+            "$DATA/Peebify Launcher/manifest-cache/**"
+          ]
+        }
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "copyright": "Copyright (c) Peebify",
+    "publisher": "Peebify",
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "resources/7z.exe": "resources/7z.exe",
+      "resources/7z.dll": "resources/7z.dll",
+      "../webui/public/icons/app.png": "icons/app.png"
+    }
+  },
+  "plugins": {}
+}

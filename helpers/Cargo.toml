@@ -1,0 +1,56 @@
+[package]
+name = "peebify-helpers"
+version = "0.1.0"
+description = "Peebify helper processes — FPS unlocker (injector + stub DLL), mod loader, overlay hotkeys"
+authors = ["Peebify"]
+license = "GPL-3.0-only"
+edition = "2021"
+publish = false
+
+[lib]
+name = "peebify_helpers"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "peebify-fps-helper"
+path = "src/bin/fps.rs"
+test = false
+
+[[bin]]
+name = "peebify-mod-loader"
+path = "src/bin/mods.rs"
+test = false
+
+[[bin]]
+name = "peebify-overlay-helper"
+path = "src/bin/overlay.rs"
+required-features = ["overlay-runtime"]
+test = false
+
+[features]
+default = ["overlay-runtime"]
+stub = ["dep:memchr"]
+overlay-runtime = []
+
+[dependencies]
+memchr = { version = "2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+tauri-winres = "0.3"
+embed-resource = "3"

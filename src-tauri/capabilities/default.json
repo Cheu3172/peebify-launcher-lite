@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the Peebify Launcher main window: listen for events (backend events, focus changes and file drops), plus the Ctrl+Shift+I devtools toggle that only exists in debug builds. The rpc app command needs no grant, convertFileSrc makes no call, and window sizing, dragging, tray and menus are driven from Rust or CSS.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:webview:allow-internal-toggle-devtools"
+  ]
+}

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "installer", "helpers"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[profile.release.package.peebify-helpers]
+opt-level = 3
+
+[profile.release.package.image]
+opt-level = 3
+
+[profile.release.package.png]
+opt-level = 3
+
+[profile.release.package.fdeflate]
+opt-level = 3
+
+[profile.release.package.memchr]
+opt-level = 3
+
+[profile.release.package.md-5]
+opt-level = 3
+
+[profile.release.package.zstd]
+opt-level = 3
+
+[profile.release.package.zstd-safe]
+opt-level = 3
+
+[profile.release.package.zstd-sys]
+opt-level = 3
+
+[profile.release.package.crc32fast]
+opt-level = 3
+
+[profile.release.package.flate2]
+opt-level = 3
+
+[profile.release.package.miniz_oxide]
+opt-level = 3
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.deflate64]
+opt-level = 3
