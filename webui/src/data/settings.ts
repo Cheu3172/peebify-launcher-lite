@@ -31,6 +31,7 @@ import {
   Undo2,
   UserRound,
   X,
+  ZoomIn,
 } from "lucide-react";
 export type SettingsCategory =
   | "general"
@@ -245,6 +246,26 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
         title: "Show quick-action buttons",
         description: "The repair / settings / folder shortcuts in the bottom-right.",
         default: "false",
+      },
+      {
+        kind: "select",
+        id: "uiScale",
+        icon: ZoomIn,
+        group: "Interface",
+        title: "Interface size",
+        description:
+          "Makes text, buttons and panels bigger or smaller. Applied on top of the automatic sizing for your monitor.",
+        options: [
+          { value: "80", label: "80%" },
+          { value: "90", label: "90%" },
+          { value: "100", label: "100% (default)" },
+          { value: "110", label: "110%" },
+          { value: "125", label: "125%" },
+          { value: "150", label: "150%" },
+          { value: "175", label: "175%" },
+          { value: "200", label: "200%" },
+        ],
+        default: "100",
       },
       {
         kind: "toggle",

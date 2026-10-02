@@ -14,6 +14,7 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   hideSocials: "false",
   hidePlaytime: "false",
   hideBottomRightButtons: "false",
+  uiScale: "100",
   animatedWallpaper: "true",
   timeFormat: "system",
   showNsfwMods: "false",
