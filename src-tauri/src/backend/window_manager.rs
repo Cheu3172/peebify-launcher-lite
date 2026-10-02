@@ -694,11 +694,7 @@ impl WindowManager {
             (Some(x), Some(y)) => Some(Bounds { x, y, w, h }),
             _ => None,
         };
-<<<<<<< Updated upstream
-        let zoom = scaled_zoom(zoom_for_landing_monitor(&win, saved_at), self.user_ui_scale());
-=======
         let zoom = zoom_for_landing_monitor(&win, saved_at, self.user_ui_scale());
->>>>>>> Stashed changes
         self.set_ui_zoom(&win, zoom);
         let (w, h) = (w * zoom, h * zoom);
         match saved_at.and_then(|at| place_on_monitors(&win, Bounds { w, h, ..at })) {
@@ -777,11 +773,7 @@ impl WindowManager {
             return;
         };
         let (area, scale) = work_area_of(&monitor);
-<<<<<<< Updated upstream
-        let zoom = scaled_zoom(ui_zoom(area, scale), self.user_ui_scale());
-=======
         let zoom = interface_zoom(area, scale, self.user_ui_scale());
->>>>>>> Stashed changes
         let previous = self.ui_zoom();
         if zoom == previous {
             return;
@@ -1294,9 +1286,6 @@ fn scaled_zoom(auto: f64, user: f64) -> f64 {
     (auto * user * 100.0).round() / 100.0
 }
 
-<<<<<<< Updated upstream
-fn zoom_for_landing_monitor(win: &WebviewWindow, saved: Option<Bounds>) -> f64 {
-=======
 // A bigger interface size stops where the minimum window would no longer fit the work area,
 // so small screens never squeeze the layout below the size it was built for.
 fn interface_zoom(area: Bounds, scale: f64, user: f64) -> f64 {
@@ -1311,7 +1300,6 @@ fn interface_zoom(area: Bounds, scale: f64, user: f64) -> f64 {
 }
 
 fn zoom_for_landing_monitor(win: &WebviewWindow, saved: Option<Bounds>, user: f64) -> f64 {
->>>>>>> Stashed changes
     let areas: Vec<(Bounds, f64)> = win
         .available_monitors()
         .map(|monitors| monitors.iter().map(work_area_of).collect())
@@ -1498,8 +1486,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< Updated upstream
-=======
     fn a_bigger_interface_size_still_fits_the_minimum_window() {
         let desktop = rect(0.0, 0.0, 2560.0, 1400.0);
         assert_eq!(interface_zoom(desktop, 1.0, 1.25), 1.25);
@@ -1511,7 +1497,6 @@ mod tests {
     }
 
     #[test]
->>>>>>> Stashed changes
     fn minimum_window_size_matches_the_config() {
         let config: Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         let main = config["app"]["windows"]
