@@ -694,7 +694,7 @@ impl WindowManager {
             (Some(x), Some(y)) => Some(Bounds { x, y, w, h }),
             _ => None,
         };
-        let zoom = zoom_for_landing_monitor(&win, saved_at);
+        let zoom = scaled_zoom(zoom_for_landing_monitor(&win, saved_at), self.user_ui_scale());
         self.set_ui_zoom(&win, zoom);
         let (w, h) = (w * zoom, h * zoom);
         match saved_at.and_then(|at| place_on_monitors(&win, Bounds { w, h, ..at })) {
@@ -728,6 +728,14 @@ impl WindowManager {
 
     fn ui_zoom(&self) -> f64 {
         f64::from_bits(self.ui_zoom.load(Ordering::SeqCst))
+    }
+
+    fn user_ui_scale(&self) -> f64 {
+        parse_ui_scale(&self.behavior("uiScale"))
+    }
+
+    pub fn apply_ui_scale(&self) {
+        self.rezoom_for_current_monitor();
     }
 
     fn set_ui_zoom(&self, win: &WebviewWindow, zoom: f64) {
@@ -765,7 +773,7 @@ impl WindowManager {
             return;
         };
         let (area, scale) = work_area_of(&monitor);
-        let zoom = ui_zoom(area, scale);
+        let zoom = scaled_zoom(ui_zoom(area, scale), self.user_ui_scale());
         let previous = self.ui_zoom();
         if zoom == previous {
             return;
@@ -1260,6 +1268,24 @@ fn ui_zoom(area: Bounds, scale: f64) -> f64 {
     zoom.clamp(UI_ZOOM_RANGE.0, UI_ZOOM_RANGE.1)
 }
 
+// The Interface size setting multiplies the automatic zoom, stored as a percentage.
+const UI_SCALE_RANGE: (f64, f64) = (0.5, 2.0);
+
+fn parse_ui_scale(value: &Value) -> f64 {
+    let percent = match value {
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        Value::Number(n) => n.as_f64(),
+        _ => None,
+    };
+    percent
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .map_or(1.0, |p| (p / 100.0).clamp(UI_SCALE_RANGE.0, UI_SCALE_RANGE.1))
+}
+
+fn scaled_zoom(auto: f64, user: f64) -> f64 {
+    (auto * user * 100.0).round() / 100.0
+}
+
 fn zoom_for_landing_monitor(win: &WebviewWindow, saved: Option<Bounds>) -> f64 {
     let areas: Vec<(Bounds, f64)> = win
         .available_monitors()
@@ -1434,6 +1460,16 @@ mod tests {
     #[test]
     fn no_monitors_means_no_placement() {
         assert_eq!(place_saved_bounds(rect(0.0, 0.0, 1280.0, 720.0), &[], None), None);
+    }
+
+    #[test]
+    fn interface_size_multiplies_the_automatic_zoom() {
+        assert_eq!(parse_ui_scale(&json!("100")), 1.0);
+        assert_eq!(parse_ui_scale(&json!("125")), 1.25);
+        assert_eq!(parse_ui_scale(&json!("900")), UI_SCALE_RANGE.1);
+        assert_eq!(parse_ui_scale(&json!("junk")), 1.0);
+        assert_eq!(parse_ui_scale(&Value::Null), 1.0);
+        assert_eq!(scaled_zoom(1.15, 1.25), 1.44);
     }
 
     #[test]

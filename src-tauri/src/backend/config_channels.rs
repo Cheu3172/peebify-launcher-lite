@@ -485,6 +485,9 @@ pub(super) async fn set_setting(app: &AppHandle, args: &[Value]) -> Result<Value
     if key.starts_with("overlay") {
         backend(app).overlay.on_setting_changed(key);
     }
+    if key == "uiScale" {
+        backend(app).window.apply_ui_scale();
+    }
     let _ = app.emit("settings-changed", json!({ "key": key, "value": value }));
     Ok(saved)
 }
@@ -1103,6 +1106,7 @@ mod write_allowlist_tests {
             "closeAction",
             "animatedWallpaper",
             "timeFormat",
+            "uiScale",
             "showNsfwMods",
             "overlayEnabled",
             "overlayAudioTracks",

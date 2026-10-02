@@ -126,6 +126,7 @@ fn default_behavior() -> Value {
         "hideNewsPanel": false,
         "disableAnimations": false,
         "osNotifications": true,
+        "uiScale": "100",
         "activeGameId": "wuwa",
 
         "modsEnabled": false,
