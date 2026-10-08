@@ -11,7 +11,8 @@ mod helper {
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, LPARAM};
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, OpenProcess, Sleep, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,

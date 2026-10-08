@@ -8,9 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_OUTOFMEMORY, HWND, LPARAM, WAIT_OBJECT_0,
-    WPARAM,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, E_OUTOFMEMORY, HWND, LPARAM, LRESULT,
+    WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     DWM_WINDOW_CORNER_PREFERENCE,
@@ -40,12 +41,15 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{
     FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Favorites,
     FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Programs, FOLDERID_SavedGames, FOLDERID_Videos,
-    IShellLinkW, SHGetKnownFolderPath, ShellExecuteExW, ShellExecuteW, ShellLink, KF_FLAG_DEFAULT,
-    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    DefSubclassProc, IShellLinkW, RemoveWindowSubclass, SHGetKnownFolderPath, SetWindowSubclass,
+    ShellExecuteExW, ShellExecuteW, ShellLink, KF_FLAG_DEFAULT, SEE_MASK_NOCLOSEPROCESS,
+    SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible, MessageBoxW, PostMessageW, IDYES,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, WM_CLOSE,
+    DefWindowProcW, EnumWindows, GetWindowThreadProcessId, IsWindowVisible, MessageBoxW,
+    PostMessageW, SystemParametersInfoW, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING,
+    MB_OK, MB_YESNO, SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CLOSE,
+    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_PAINT,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
@@ -415,10 +419,24 @@ fn own_visible_windows() -> Vec<HWND> {
     found
 }
 
-pub fn round_own_windows() -> bool {
+pub fn animations_enabled() -> bool {
+    let mut enabled = windows::core::BOOL(1);
+    let queried = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut enabled as *mut windows::core::BOOL as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    queried.is_err() || enabled.as_bool()
+}
+
+pub fn style_own_windows() -> bool {
     let found = own_visible_windows();
     unsafe {
         for hwnd in &found {
+            let _ = SetWindowSubclass(*hwnd, Some(drag_subclass), DRAG_SUBCLASS_ID, 0);
             let round = DWMWCP_ROUND;
             let _ = DwmSetWindowAttribute(
                 *hwnd,
@@ -436,6 +454,38 @@ pub fn round_own_windows() -> bool {
         }
     }
     !found.is_empty()
+}
+
+const DRAG_SUBCLASS_ID: usize = 0x5045_4542;
+
+// Windows moves a window from a modal loop on the window's own thread. winit answers every
+// WM_PAINT in that loop with a full egui frame that waits for vsync, so the window trails the
+// pointer in steps and the text smears (rust-windowing/winit#4708). While a move is in progress
+// paints go to DefWindowProc instead, and one real repaint follows when it ends. The reference
+// data is the in-move flag; SetWindowSubclass on an installed subclass only replaces it.
+unsafe extern "system" fn drag_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    moving: usize,
+) -> LRESULT {
+    match msg {
+        WM_ENTERSIZEMOVE => {
+            let _ = SetWindowSubclass(hwnd, Some(drag_subclass), DRAG_SUBCLASS_ID, 1);
+        }
+        WM_EXITSIZEMOVE => {
+            let _ = SetWindowSubclass(hwnd, Some(drag_subclass), DRAG_SUBCLASS_ID, 0);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        WM_PAINT if moving != 0 => return DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(drag_subclass), DRAG_SUBCLASS_ID);
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
 fn process_image_path(pid: u32) -> Option<PathBuf> {

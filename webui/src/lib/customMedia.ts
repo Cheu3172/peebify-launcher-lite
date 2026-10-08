@@ -1,6 +1,6 @@
 // ------------ Custom Media ------------
-// Works out which icon or wallpaper to show for a game: the one the user picked, the one from the server,
-// or the built-in default. Also turns local file paths into URLs the webview can load.
+// Works out which icon or wallpaper to show for a game: the one the user picked, the one from the server, or the built-in
+// default. Also turns local file paths into URLs the webview can load.
 import type { SyntheticEvent } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { isTauri } from "./tauri";

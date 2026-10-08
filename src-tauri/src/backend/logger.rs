@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime};
 use parking_lot::Mutex;
 use serde_json::Value;
 
-const KEEP_LAUNCH_LOGS: usize = 10;
-const KEEP_LAUNCH_LOG_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 14);
+// Pruning runs before the new session's log is created, so four older ones plus it make five.
+const KEEP_PREVIOUS_LAUNCH_LOGS: usize = 4;
 const MAX_LAUNCH_LOGS_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_CRASH_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_LAUNCH_LOG_BYTES: u64 = 8 * 1024 * 1024;
@@ -266,7 +266,7 @@ fn launch_log_group(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn stale_launch_logs(files: Vec<LaunchLogFile>, now: SystemTime) -> Vec<String> {
+fn stale_launch_logs(files: Vec<LaunchLogFile>) -> Vec<String> {
     let mut groups: BTreeMap<String, Vec<LaunchLogFile>> = BTreeMap::new();
     for file in files {
         groups
@@ -276,13 +276,11 @@ fn stale_launch_logs(files: Vec<LaunchLogFile>, now: SystemTime) -> Vec<String> 
     }
     let mut stale = Vec::new();
     let mut kept_bytes: u64 = 0;
-    for (index, group) in groups.into_values().rev().enumerate() {
-        let newest = group.iter().map(|f| f.modified).max().unwrap_or(now);
-        let recent = now
-            .duration_since(newest)
-            .map_or(true, |age| age < KEEP_LAUNCH_LOG_AGE);
+    let mut groups: Vec<Vec<LaunchLogFile>> = groups.into_values().collect();
+    groups.sort_by_key(|group| group.iter().map(|f| f.modified).max());
+    for (index, group) in groups.into_iter().rev().enumerate() {
         let bytes: u64 = group.iter().map(|f| f.len).sum();
-        let keep = (index < KEEP_LAUNCH_LOGS || recent)
+        let keep = index < KEEP_PREVIOUS_LAUNCH_LOGS
             && kept_bytes.saturating_add(bytes) <= MAX_LAUNCH_LOGS_TOTAL_BYTES;
         if keep {
             kept_bytes += bytes;
@@ -312,7 +310,7 @@ fn prune_old_launch_logs(dir: &Path) {
             })
         })
         .collect();
-    for stale in stale_launch_logs(files, SystemTime::now()) {
+    for stale in stale_launch_logs(files) {
         let _ = std::fs::remove_file(dir.join(stale));
     }
 }
@@ -736,39 +734,41 @@ mod tests {
     }
 
     #[test]
-    fn retention_keeps_recent_days_beyond_the_count() {
+    fn retention_keeps_only_the_newest_four_however_recent() {
         let now = SystemTime::now();
         let files: Vec<LaunchLogFile> = (0..20)
             .map(|i| log_file(&format!("launch-2026-09-{:02}.log", i + 1), 20 - i as u64, 1024, now))
             .collect();
-        let mut stale = stale_launch_logs(files, now);
+        let mut stale = stale_launch_logs(files);
         stale.sort();
-        let expected: Vec<String> = (0..7)
+        let expected: Vec<String> = (0..16)
             .map(|i| format!("launch-2026-09-{:02}.log", i + 1))
             .collect();
         assert_eq!(stale, expected);
     }
 
     #[test]
-    fn retention_keeps_the_newest_ten_even_when_old() {
+    fn retention_follows_modified_time_not_the_name() {
         let now = SystemTime::now();
-        let files: Vec<LaunchLogFile> = (0..12)
-            .map(|i| log_file(&format!("launch-2026-01-{:02}.log", i + 1), 100, 1024, now))
-            .collect();
-        let mut stale = stale_launch_logs(files, now);
-        stale.sort();
-        assert_eq!(stale, vec!["launch-2026-01-01.log", "launch-2026-01-02.log"]);
+        let files = vec![
+            log_file("launch-a.log", 1, 1024, now),
+            log_file("launch-b.log", 5, 1024, now),
+            log_file("launch-c.log", 2, 1024, now),
+            log_file("launch-d.log", 3, 1024, now),
+            log_file("launch-e.log", 4, 1024, now),
+        ];
+        assert_eq!(stale_launch_logs(files), vec!["launch-b.log"]);
     }
 
     #[test]
     fn retention_pairs_rotated_files_with_their_base() {
         let now = SystemTime::now();
-        let mut files: Vec<LaunchLogFile> = (0..11)
-            .map(|i| log_file(&format!("launch-2026-01-{:02}.log", i + 1), 100, 1024, now))
+        let mut files: Vec<LaunchLogFile> = (0..5)
+            .map(|i| log_file(&format!("launch-2026-01-{:02}.log", i + 1), 10 - i as u64, 1024, now))
             .collect();
-        files.push(log_file("launch-2026-01-11.1.log", 100, 1024, now));
-        files.push(log_file("launch-2026-01-01.1.log", 100, 1024, now));
-        let mut stale = stale_launch_logs(files, now);
+        files.push(log_file("launch-2026-01-05.1.log", 6, 1024, now));
+        files.push(log_file("launch-2026-01-01.1.log", 10, 1024, now));
+        let mut stale = stale_launch_logs(files);
         stale.sort();
         assert_eq!(stale, vec!["launch-2026-01-01.1.log", "launch-2026-01-01.log"]);
     }
@@ -777,10 +777,10 @@ mod tests {
     fn retention_caps_the_total_size() {
         let now = SystemTime::now();
         let mb = 1024 * 1024;
-        let files: Vec<LaunchLogFile> = (0..8)
-            .map(|i| log_file(&format!("launch-2026-09-{:02}.log", i + 1), 1, 8 * mb, now))
+        let files: Vec<LaunchLogFile> = (0..4)
+            .map(|i| log_file(&format!("launch-2026-09-{:02}.log", i + 1), 4 - i as u64, 20 * mb, now))
             .collect();
-        let mut stale = stale_launch_logs(files, now);
+        let mut stale = stale_launch_logs(files);
         stale.sort();
         assert_eq!(stale, vec!["launch-2026-09-01.log", "launch-2026-09-02.log"]);
     }

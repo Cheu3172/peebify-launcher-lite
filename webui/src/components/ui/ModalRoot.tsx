@@ -20,15 +20,13 @@ export function ModalRoot() {
     close();
   };
 
-  const width = modal?.kind === "install" ? 500 : 420;
-  const isForm = modal?.kind === "install";
+  const width = modal?.kind === "install" ? 780 : 420;
 
   return (
     <Modal
       open={!!modal}
       onClose={infoOnly ? confirm : close}
       width={width}
-      dismissOnBackdrop={!isForm}
       labelledBy={isConfirm ? titleId : undefined}
       describedBy={isConfirm ? messageId : undefined}
     >

@@ -9,20 +9,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use md5::{Digest, Md5};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
 
 use super::download_engine::combine_url;
+use super::fs_util::ContentHasher;
 use super::game_profiles::InstallMode;
 use super::queue::{Phase, Update};
 use super::state::BackendState;
 use super::validator::{FileCheck, FileValidator, Resource};
 use super::{
     bd2, download_engine, game_profiles, http, hypergryph_reconcile as reconcile, nte,
-    progress, sophon,
+    progress, sophon, yostar,
 };
 
 pub mod status {
@@ -513,6 +513,111 @@ impl GameRepairManager {
     // ------------ Standard Repair Flow ------------
     // The entry point for every repair. It hands off to the game-specific flows when the
     // game needs one, and otherwise runs the plain index, validate and re-download loop.
+    /// Every file is checked against the build's published MD5 list. Pan Studio only publishes whole-game archives, so any damage
+    /// is fixed by unpacking the full archive over the folder again, as the official launcher's repair does.
+    async fn run_dna_repair(self: &Arc<Self>, game_path: &Path, start_ms: i64) -> Result<(), String> {
+        let profile = self.profile();
+        let name = game_profiles::display_name(profile);
+
+        self.send_progress(SCAN_PHASE, json!({ "status": status::FETCHING_CONFIG }));
+        let manifest = self.cancellable(super::dna::fetch_manifest(profile)).await?;
+        let installed = super::dna::installed_version(game_path);
+        if installed.is_some_and(|v| v != manifest.latest) {
+            return Err(format!(
+                "An update for {name} is available. Update it instead, which replaces every file."
+            ));
+        }
+        let hashes = self.cancellable(super::dna::fetch_hashes(profile, &manifest)).await?;
+        let file_count = hashes.len();
+        let total_bytes = super::dna::listed_bytes(game_path, &hashes);
+
+        self.tracker.begin("validating", total_bytes as f64, file_count, None);
+        self.send_metrics_progress(SCAN_PHASE, status::VALIDATING, json!({}));
+        let scan_engine = Arc::clone(self);
+        let scan_dir = game_path.to_path_buf();
+        let scan_cancel = Arc::clone(self.gate.flag());
+        let scan_hashes = hashes.clone();
+        let broken = tauri::async_runtime::spawn_blocking(move || {
+            super::dna::verify_files(&scan_dir, &scan_hashes, &scan_cancel, |bytes| {
+                scan_engine.block_while_paused();
+                scan_engine.tracker.update_validation_progress(bytes as f64);
+                if scan_engine.tracker.should_update_ui() {
+                    scan_engine.send_metrics_progress(SCAN_PHASE, status::VALIDATING, json!({}));
+                }
+            })
+        })
+        .await
+        .map_err(|e| format!("{name} repair scan panicked: {e}"))??;
+
+        if broken.is_empty() {
+            log::info!("{name} repair: all {file_count} files match build {}.", manifest.latest);
+            if installed.is_none() {
+                let _ = super::dna::write_installed_version(game_path, manifest.latest);
+            }
+            self.clear_unfinished_update();
+            self.handle_repair_complete(start_ms, 0, file_count);
+            return Ok(());
+        }
+        log::info!(
+            "{name} repair: {} of {file_count} files do not match build {}; unpacking the full archive over the install.",
+            broken.len(),
+            manifest.latest
+        );
+
+        let hpatchz = super::fs_util::resource(&self.app, super::dna::HPATCHZ).ok_or_else(|| {
+            format!("{name} is repaired with {}, which is missing from Peebify's install. Reinstall Peebify to restore it.", super::dna::HPATCHZ)
+        })?;
+        self.send_progress(Phase::Downloading, json!({ "status": status::FETCHING_CONFIG }));
+        let (_, package) = self.cancellable(super::dna::fetch_package(profile, installed, true)).await?;
+        let patch_dir = game_path.join(super::dna::PATCH_DIR);
+        std::fs::create_dir_all(&patch_dir)
+            .map_err(|e| crate::backend::fs_util::fmt_io("Could not create the download folder", &e))?;
+        let archive = crate::backend::fs_util::safe_join(&patch_dir, &package.file_name)?;
+        download_engine::ensure_disk_space(game_path, package.download_bytes, 1.0, download_engine::HEADROOM_REPAIR)?;
+
+        self.tracker.reset();
+        self.tracker.set_totals(package.download_bytes as f64, broken.len());
+        self.tracker.set_phase("repairing");
+        self.send_metrics_progress(Phase::Repairing, status::REPAIRING, json!({}));
+        let url = package.urls.first().ok_or("no download mirror for the archive")?;
+        self.download_package(url, &archive).await?;
+
+        self.wait_while_paused().await;
+        if self.is_cancelled() {
+            return Err("Repair aborted".to_string());
+        }
+        if self.gate.resume() {
+            self.set_paused_power(false);
+            log::info!("Unpacking cannot pause, so the pending pause was lifted.");
+        }
+        self.tracker.reset();
+        self.tracker.set_totals(package.install_bytes as f64, broken.len());
+        self.tracker.set_phase("extracting");
+        self.tracker.force_next_update();
+        self.send_metrics_progress(Phase::Extracting, status::UNPACKING, json!({}));
+
+        let patched = self
+            .cancellable(download_engine::run_hpatchz(&hpatchz, None, &archive, game_path))
+            .await;
+        if patched.is_ok() {
+            let _ = std::fs::remove_dir_all(&patch_dir);
+        }
+        patched?;
+
+        if let Err(e) = super::dna::write_installed_version(game_path, package.version) {
+            log::warn!("{name} repair: {e}");
+        }
+        if let Err(e) = download_engine::update_game_config_file(game_path, &package.version.to_string()) {
+            log::warn!("{name} repair: could not record build {}: {e}", package.version);
+        }
+        for _ in 0..broken.len() {
+            self.tracker.increment_repaired_files();
+        }
+        self.clear_unfinished_update();
+        self.handle_repair_complete(start_ms, broken.len(), file_count);
+        Ok(())
+    }
+
     async fn run_repair(
         self: &Arc<Self>,
         game_path: &Path,
@@ -536,7 +641,8 @@ impl GameRepairManager {
             InstallMode::Netease => return self.run_nte_repair(game_path, mode, start_ms).await,
             InstallMode::Bluepoch => return self.run_bluepoch_repair(game_path, start_ms).await,
             InstallMode::Bd2 => return self.run_bd2_repair(game_path, start_ms).await,
-            InstallMode::Default | InstallMode::Gf2 | InstallMode::Unknown => {}
+            InstallMode::Dna => return self.run_dna_repair(game_path, start_ms).await,
+            InstallMode::Default | InstallMode::Gf2 | InstallMode::Yostar | InstallMode::Unknown => {}
         }
 
         let mut remote_version: Option<String> = None;
@@ -588,6 +694,7 @@ impl GameRepairManager {
         if corrupt.is_empty() {
             if records_scan {
                 self.record_scan(game_path, &resources).await;
+                self.record_verified_version(game_path, remote_version.as_deref());
             }
             let client = self.maybe_reconcile_gf2_client(game_path, mode).await?;
             if from_remote_index && mode != "quick" && client.is_some() {
@@ -611,6 +718,7 @@ impl GameRepairManager {
         }
         if records_scan {
             self.record_scan(game_path, &resources).await;
+            self.record_verified_version(game_path, remote_version.as_deref());
         }
 
         let mut repaired = self.tracker.repaired_files();
@@ -678,9 +786,24 @@ impl GameRepairManager {
         Ok(Some(stats.repaired))
     }
 
+    fn record_verified_version(&self, game_path: &Path, version: Option<&str>) {
+        let Some(version) = version.filter(|v| !v.is_empty()) else {
+            return;
+        };
+        if InstallMode::of(self.profile()) != InstallMode::Yostar {
+            return;
+        }
+        if let Err(e) = download_engine::update_game_config_file(game_path, version) {
+            log::warn!("Could not record version {version} after the full repair: {e}");
+        }
+    }
+
     fn refuse_stale_repair(&self, game_path: &Path, remote_version: &str) -> Result<(), String> {
         let profile = self.profile();
-        if !matches!(InstallMode::of(profile), InstallMode::Default | InstallMode::Gf2) {
+        if !matches!(
+            InstallMode::of(profile),
+            InstallMode::Default | InstallMode::Gf2 | InstallMode::Yostar
+        ) {
             return Ok(());
         }
         let local = super::game_manager::local_game_version_for(profile, &game_path.to_string_lossy());
@@ -696,7 +819,7 @@ impl GameRepairManager {
     }
 
     fn prunes_removed_resources(&self) -> bool {
-        InstallMode::of(self.profile()) == InstallMode::Default
+        download_engine::prunes_removed(InstallMode::of(self.profile()))
     }
 
     async fn sync_local_index(&self, game_path: &Path, resources: &[Resource]) {
@@ -788,6 +911,9 @@ impl GameRepairManager {
             return self
                 .cancellable(download_engine::resolve_gf2_config(profile))
                 .await;
+        }
+        if InstallMode::of(profile) == InstallMode::Yostar {
+            return self.cancellable(yostar::resolve_config(profile)).await;
         }
 
         self.send_progress(phase, json!({ "status": status::FETCHING_INDEX }));
@@ -1079,7 +1205,10 @@ impl GameRepairManager {
                 let url = resource
                     .url()
                     .map(str::to_string)
-                    .unwrap_or_else(|| combine_url(base_url, &dest));
+                    .unwrap_or_else(|| {
+                        let mode = InstallMode::of(self.profile());
+                        combine_url(base_url, &download_engine::remote_path(mode, &dest))
+                    });
                 if let Some(parent) = file_path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
@@ -1236,13 +1365,14 @@ impl GameRepairManager {
         result
     }
 
-    async fn hash_partial(&self, file_path: &Path) -> Result<Md5, String> {
+    async fn hash_partial(&self, file_path: &Path, expected: &str) -> Result<ContentHasher, String> {
         let path = file_path.to_path_buf();
+        let expected = expected.to_string();
         let cancelled = Arc::clone(self.gate.flag());
         tauri::async_runtime::spawn_blocking(move || {
             use std::io::Read;
             let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            let mut hasher = Md5::new();
+            let mut hasher = ContentHasher::for_expected(&expected);
             let mut buffer = vec![0u8; 1 << 20];
             loop {
                 if cancelled.load(Ordering::SeqCst) {
@@ -1271,9 +1401,9 @@ impl GameRepairManager {
             .ok()
             .filter(|m| m.is_file())
             .map_or(0, |m| m.len());
-        let mut hasher = (!expected_md5.is_empty()).then(Md5::new);
+        let mut hasher = (!expected_md5.is_empty()).then(|| ContentHasher::for_expected(expected_md5));
         if resume_from > 0 && hasher.is_some() {
-            match self.hash_partial(file_path).await {
+            match self.hash_partial(file_path, expected_md5).await {
                 Ok(partial) => hasher = Some(partial),
                 Err(e) => {
                     if self.is_cancelled() {
@@ -1329,7 +1459,7 @@ impl GameRepairManager {
                     "[repair] Server ignored the Range request for {}, restarting it",
                     file_path.display()
                 );
-                hasher = (!expected_md5.is_empty()).then(Md5::new);
+                hasher = (!expected_md5.is_empty()).then(|| ContentHasher::for_expected(expected_md5));
                 self.tracker.set_file_progress_absolute(progress_id, 0.0);
             }
             tokio::fs::File::create(file_path)
@@ -1382,7 +1512,7 @@ impl GameRepairManager {
             .await
             .map_err(|e| format!("Write error: {e}"))?;
         if let Some(h) = hasher {
-            let got = hex::encode(h.finalize());
+            let got = h.finish();
             if !got.eq_ignore_ascii_case(expected_md5) {
                 return Err(format!(
                     "failed verification after re-download (got {got}, expected {expected_md5})"

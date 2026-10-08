@@ -24,6 +24,20 @@ function readContext(context: Props["context"]): Record<string, unknown> | strin
   }
 }
 
+const RETRY_WINDOW_MS = 10_000;
+let lastRetryAt = 0;
+
+// "Try again" first just re-draws the crashed part. If it crashes again straight after a retry, re-drawing won't
+// help (a broken module, a stale reload), so the next press reloads the whole launcher instead.
+export function retryOrReload(reset: () => void): void {
+  if (Date.now() - lastRetryAt < RETRY_WINDOW_MS) {
+    window.location.reload();
+    return;
+  }
+  lastRetryAt = Date.now();
+  reset();
+}
+
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null };
 
@@ -58,7 +72,7 @@ export class ErrorBoundary extends Component<Props, State> {
           className="rounded-lg bg-white/10 px-4 py-2 text-sm hover:bg-white/20"
           onClick={() => window.location.reload()}
         >
-          Reload launcher
+          Try again
         </button>
       </div>
     );

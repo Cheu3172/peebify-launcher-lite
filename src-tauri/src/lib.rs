@@ -160,6 +160,10 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        // tao listens to raw mouse input by default, and with a high polling-rate mouse every
+        // report runs a pass of the event loop on the thread that moves the window, so dragging
+        // it stutters. Nothing here uses device events.
+        .device_event_filter(tauri::DeviceEventFilter::Always)
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             let Some(state) = app.try_state::<BackendState>() else {
                 return;

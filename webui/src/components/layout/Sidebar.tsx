@@ -89,11 +89,13 @@ export function Sidebar() {
           ))}
         </nav>
 
-        <div className="my-[11px] h-px w-[26px] shrink-0 bg-white/10" />
+        <div className="mt-[11px] h-px w-[26px] shrink-0 bg-white/10" />
 
         <div
           ref={reorder.containerRef}
-          className="rail-scroll scrollbar-none flex min-h-0 flex-1 flex-col items-center gap-[6px] overflow-y-auto overflow-x-hidden"
+          // The 12px of padding matches the fade at the list edges (.rail-scroll), so icons at rest sit clear of it
+          // and only fade while they scroll past the edge.
+          className="rail-scroll scrollbar-none flex min-h-0 flex-1 flex-col items-center gap-[6px] overflow-y-auto overflow-x-hidden py-[12px]"
         >
           {visible.map((id) => {
             const game = gameById(id);
@@ -150,7 +152,7 @@ export function Sidebar() {
           {moved ? `${gameById(moved.id).name}, position ${moved.position} of ${moved.total}` : ""}
         </span>
 
-        <div className="mt-auto flex shrink-0 flex-col items-center gap-[5px] pt-[10px]">
+        <div className="mt-auto flex shrink-0 flex-col items-center gap-[5px]">
           <span className="text-[9px] font-medium uppercase tracking-[0.1em] text-white/50">
             {CHANNEL_LABEL[buildType]}
           </span>

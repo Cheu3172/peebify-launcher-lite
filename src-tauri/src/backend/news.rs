@@ -733,7 +733,7 @@ mod channels {
     use super::super::state::BackendState;
     use super::super::{
         arg_str, err_response, game_profiles, hoyoplay, http, hypergryph, ok_with,
-        resolve_profile,
+        nexon_forum, resolve_profile, yostar,
     };
 
     const NEWS_CACHE_TTL: Duration = Duration::from_secs(60 * 10);
@@ -810,6 +810,9 @@ mod channels {
             (Some("gf2"), _) => ("GF2", super::get_gf2_news().await),
             (Some("bluepoch"), _) => ("Bluepoch", super::get_bluepoch_news(profile).await),
             (Some("bd2"), _) => ("Brown Dust II", super::get_bd2_news(profile).await),
+            (Some("dna"), _) => ("Duet Night Abyss", super::super::dna::get_news(profile).await),
+            (Some("yostar"), _) => ("Yostar", yostar::get_news(profile).await),
+            (_, Some("nexon")) => ("Nexon forum", nexon_forum::get_news(profile).await),
             (_, Some("pgr")) => ("PGR", super::get_pgr_news().await),
             (_, Some("gf1")) => ("GF1", super::get_gf1_news().await),
             (Some("netease"), _) => ("NTE", super::nte_site::get_nte_news().await),

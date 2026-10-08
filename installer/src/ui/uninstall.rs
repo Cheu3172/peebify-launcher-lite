@@ -1,6 +1,7 @@
 // ------------ Uninstall Window ------------
-// What opens from Installed apps or uninstall.exe. Shows the version and size, lets you also delete settings and
-// installed games (Steam and protected folders are kept), then hands off to the second stage that does the removal.
+// What opens from Installed apps or uninstall.exe, running from the temp copy setup makes of itself. Lets you also
+// delete settings and installed games (Steam and protected folders are kept), then removes everything in the same
+// window and ends on All done, a partial result or Failed with Retry.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,123 +9,208 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, RichText};
 
 use crate::install::{
-    dir_size, game_dir_verdict, human_bytes, installed_game_dirs, respawn_for_uninstall,
-    GameDirVerdict, InstallManifest, UninstallOptions,
+    dir_size, game_dir_verdict, human_bytes, installed_game_dirs, perform_uninstall,
+    respawn_for_uninstall, GameDirVerdict, InstallManifest, SecondStage, UninstallOptions,
 };
+use crate::msg::EngineEvent;
 use crate::ui;
 
+pub enum Start {
+    Choose,
+    Remove(UninstallOptions),
+}
+
+pub struct Launch {
+    pub install_dir: PathBuf,
+    pub staged: bool,
+    pub start: Start,
+}
+
 fn identity_line(install_dir: &Path) -> String {
-    let Ok(manifest) = InstallManifest::load(install_dir) else {
-        return "Installed on this PC".to_string();
-    };
-    let mut parts = vec![manifest.version.clone()];
-    if let Ok(when) = chrono::DateTime::parse_from_rfc3339(&manifest.installed_at) {
-        use chrono::Datelike;
-        let local = when.with_timezone(&chrono::Local);
-        parts.push(format!(
-            "installed {} {}, {}",
-            local.format("%B"),
-            local.day(),
-            local.year()
-        ));
+    match InstallManifest::load(install_dir) {
+        Ok(manifest) => format!("Version {}", manifest.version),
+        Err(_) => "Installed on this PC".to_string(),
     }
-    let footprint: u64 = manifest
-        .files
-        .iter()
-        .filter_map(|f| std::fs::metadata(install_dir.join(f)).ok())
-        .map(|m| m.len())
-        .sum();
-    if footprint > 0 {
-        parts.push(human_bytes(footprint));
-    }
-    parts.join(" · ")
 }
 
-#[derive(Default)]
-struct Games {
-    dirs: Option<Vec<(PathBuf, GameDirVerdict)>>,
-    sizes: Vec<Option<u64>>,
+struct GameDir {
+    path: PathBuf,
+    verdict: GameDirVerdict,
 }
 
-fn scan_games(install_dir: PathBuf, games: Arc<Mutex<Games>>, ctx: egui::Context) {
+impl GameDir {
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.display().to_string())
+    }
+}
+
+fn measure_games(dirs: Vec<PathBuf>, sizes: Arc<Mutex<Vec<Option<u64>>>>, ctx: egui::Context) {
     std::thread::spawn(move || {
-        let found: Vec<(PathBuf, GameDirVerdict)> = installed_game_dirs(&install_dir)
-            .into_iter()
-            .map(|dir| {
-                let verdict = game_dir_verdict(&dir);
-                (dir, verdict)
-            })
-            .collect();
-        let dirs: Vec<PathBuf> = found.iter().map(|(dir, _)| dir.clone()).collect();
-        if let Ok(mut games) = games.lock() {
-            games.sizes = vec![None; found.len()];
-            games.dirs = Some(found);
-        }
-        ctx.request_repaint();
         for (i, dir) in dirs.iter().enumerate() {
             let size = dir_size(dir);
-            if let Ok(mut games) = games.lock() {
-                games.sizes[i] = Some(size);
+            if let Ok(mut sizes) = sizes.lock() {
+                sizes[i] = Some(size);
             }
             ctx.request_repaint();
         }
     });
 }
 
-pub fn run(install_dir: PathBuf) -> eframe::Result<()> {
+pub fn run(launch: Launch) -> eframe::Result<i32> {
     let options = eframe::NativeOptions {
         viewport: ui::viewport(ui::WINDOW),
         centered: true,
         ..Default::default()
     };
-    let identity = identity_line(&install_dir);
+    let identity = identity_line(&launch.install_dir);
+    let games: Vec<GameDir> = match launch.start {
+        Start::Choose => installed_game_dirs(&launch.install_dir)
+            .into_iter()
+            .map(|path| {
+                let verdict = game_dir_verdict(&path);
+                GameDir { path, verdict }
+            })
+            .collect(),
+        Start::Remove(_) => Vec::new(),
+    };
+    let outcome = std::rc::Rc::new(std::cell::Cell::new(crate::exit::OK));
+    let result_slot = outcome.clone();
     eframe::run_native(
         "Uninstall Peebify Launcher",
         options,
         Box::new(move |cc| {
             ui::apply_theme(&cc.egui_ctx);
-            let games = Arc::new(Mutex::new(Games::default()));
-            scan_games(install_dir.clone(), games.clone(), cc.egui_ctx.clone());
-            Ok(Box::new(UninstallApp {
+            let sizes = Arc::new(Mutex::new(vec![None; games.len()]));
+            measure_games(
+                games.iter().map(|g| g.path.clone()).collect(),
+                sizes.clone(),
+                cc.egui_ctx.clone(),
+            );
+            let mut app = UninstallApp {
                 logo: ui::load_logo(&cc.egui_ctx),
                 identity,
-                install_dir,
+                install_dir: launch.install_dir,
+                staged: launch.staged,
                 games,
+                sizes,
                 remove_data: false,
                 remove_games: false,
+                screen: Screen::Choose,
+                rx: None,
+                pacer: ui::Pacer::new(""),
+                warnings: Vec::new(),
                 error: None,
+                respawn_error: None,
+                last_run: None,
+                copied: ui::Copied::default(),
                 chrome: ui::Chrome::default(),
-            }))
+                outcome: result_slot,
+            };
+            if let Start::Remove(opts) = launch.start {
+                app.start_removal(opts);
+            }
+            Ok(Box::new(app))
         }),
-    )
+    )?;
+    Ok(outcome.get())
+}
+
+#[derive(Clone, Copy, PartialEq, Hash, Debug)]
+enum Screen {
+    Choose,
+    Removing,
+    Removed,
+    Failed,
 }
 
 struct UninstallApp {
     logo: Option<egui::TextureHandle>,
     identity: String,
     install_dir: PathBuf,
-    games: Arc<Mutex<Games>>,
+    staged: bool,
+    games: Vec<GameDir>,
+    sizes: Arc<Mutex<Vec<Option<u64>>>>,
     remove_data: bool,
     remove_games: bool,
+    screen: Screen,
+    rx: Option<std::sync::mpsc::Receiver<EngineEvent>>,
+    pacer: ui::Pacer,
+    warnings: Vec<String>,
     error: Option<String>,
+    respawn_error: Option<String>,
+    last_run: Option<UninstallOptions>,
+    copied: ui::Copied,
     chrome: ui::Chrome,
+    outcome: std::rc::Rc<std::cell::Cell<i32>>,
 }
 
 impl UninstallApp {
-    fn still_measuring(&self) -> bool {
+    fn any_removable(&self) -> bool {
         self.games
-            .lock()
-            .map(|g| g.dirs.is_none() || g.sizes.iter().any(Option::is_none))
-            .unwrap_or(false)
+            .iter()
+            .any(|g| g.verdict == GameDirVerdict::Removable)
     }
 
-    fn any_removable(&self) -> Option<bool> {
-        let games = self.games.lock().ok()?;
-        let dirs = games.dirs.as_ref()?;
-        Some(
-            dirs.iter()
-                .any(|(_, verdict)| *verdict == GameDirVerdict::Removable),
-        )
+    fn options(&self) -> UninstallOptions {
+        UninstallOptions {
+            install_dir: self.install_dir.clone(),
+            remove_data: self.remove_data,
+            remove_games: self.remove_games && self.any_removable(),
+        }
+    }
+
+    fn start_removal(&mut self, opts: UninstallOptions) {
+        self.error = None;
+        self.warnings.clear();
+        self.outcome.set(crate::exit::OK);
+        self.pacer = ui::Pacer::new("Closing the launcher…");
+        self.screen = Screen::Removing;
+        self.last_run = Some(opts.clone());
+        self.rx = Some(ui::spawn_engine(move |sink| perform_uninstall(&opts, sink)));
+    }
+
+    fn drain_events(&mut self) {
+        let Some(rx) = &self.rx else { return };
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                EngineEvent::Status { phase, percent } => self.pacer.report(&phase, percent),
+                EngineEvent::Warning(w) => self.warnings.push(w),
+                EngineEvent::Committed => {}
+                EngineEvent::Finished => {
+                    self.pacer.finish_as("Cleaning up…");
+                    self.rx = None;
+                    return;
+                }
+                EngineEvent::Cancelled => {
+                    self.outcome.set(crate::exit::CANCELLED);
+                    self.rx = None;
+                    self.screen = Screen::Choose;
+                    return;
+                }
+                EngineEvent::Failed(e) => {
+                    self.outcome.set(crate::exit::FAILED);
+                    self.error = Some(e);
+                    self.screen = Screen::Failed;
+                    self.rx = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn begin(&mut self, ctx: &egui::Context) {
+        let opts = self.options();
+        if self.staged {
+            self.start_removal(opts);
+            return;
+        }
+        match respawn_for_uninstall(&opts, SecondStage::Run) {
+            Ok(()) => ui::close(ctx),
+            Err(e) => self.respawn_error = Some(e),
+        }
     }
 }
 
@@ -133,166 +219,307 @@ impl eframe::App for UninstallApp {
         ui::clear_color()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         self.chrome.apply();
-        if self.still_measuring() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        self.drain_events();
+        if self.rx.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.screen == Screen::Removing {
+            self.pacer.tick();
+            if self.rx.is_none() && self.pacer.settled() {
+                self.screen = Screen::Removed;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.screen != Screen::Removing {
+            ui::close(ctx);
         }
 
+        let screen = self.screen;
         let logo = self.logo.clone();
-        let rail = ui::Rail::new(logo.as_ref(), self.identity.clone()).logo_alpha(0.75);
+        let rail = ui::Rail::new(logo.as_ref(), self.identity.clone());
+        let rail = if screen == Screen::Failed {
+            rail.failed()
+        } else {
+            rail.muted()
+        };
+        let mood = match screen {
+            Screen::Choose => ui::Mood::UNINSTALL,
+            Screen::Removing => ui::Mood::REMOVING,
+            Screen::Removed => ui::Mood::REMOVED,
+            Screen::Failed => ui::Mood::FAILED,
+        };
+        let closable = if screen == Screen::Removing {
+            ui::Close::Disabled
+        } else {
+            ui::Close::Enabled
+        };
 
-        ui::split(
-            ctx,
-            ui::Surface::Uninstall,
-            ui::SCRIM_UNINSTALL,
-            ui::Close::Enabled,
-            rail,
-            |body| {
-                body.add_space(12.0);
-                ui::heading(body, "UNINSTALL", 26.0);
-                body.add_space(12.0);
-                ui::paragraph(
-                    body,
-                    "This removes the launcher itself, but you can choose what you do \
-                     and don't want removed.",
-                    ui::text::BODY,
-                    ui::tx(0.68),
-                    340.0,
-                );
-
-                body.add_space(20.0);
-                ui::card(body, ui::Tone::Plain, 15, |card| {
-                    ui::checkbox(
-                        card,
-                        &mut self.remove_data,
-                        "Also delete settings, mods and launcher data",
-                    );
-                    card.add_space(3.0);
-                    ui::sub_note(
-                        card,
-                        "Mods in the default mods folder and the mod loader are removed \
-                         too. Installed games are not touched by this option.",
-                    );
-                    match self.any_removable() {
-                        Some(true) => {
-                            card.add_space(13.0);
-                            ui::checkbox(
-                                card,
-                                &mut self.remove_games,
-                                "Also delete installed game files",
-                            );
-                            card.add_space(13.0);
-                            self.game_list(card);
-                        }
-                        Some(false) => {}
-                        None => {
-                            card.add_space(13.0);
-                            card.label(
-                                RichText::new("Checking installed games…")
-                                    .size(ui::text::SM)
-                                    .color(ui::tx(0.56)),
-                            );
-                        }
-                    }
-                });
-
-                if let Some(err) = &self.error {
-                    body.add_space(10.0);
-                    body.label(
-                        RichText::new(err.as_str())
-                            .size(ui::text::XS)
-                            .color(ui::DANGER_TEXT),
-                    );
-                }
-
-                let mut remove = false;
-                let mut keep = false;
-                ui::footer(body, |foot| {
-                    ui::action_row(foot, true, |row| {
-                        let label = if self.remove_games {
-                            "Uninstall and delete games"
-                        } else {
-                            "Uninstall"
-                        };
-                        remove = ui::danger_button(row, label).clicked();
-                        row.add_space(10.0);
-                        keep = ui::secondary_button(row, "Keep it").clicked();
-                    });
-                });
-
-                if keep {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                } else if remove {
-                    let opts = UninstallOptions {
-                        install_dir: self.install_dir.clone(),
-                        remove_data: self.remove_data,
-                        remove_games: self.remove_games,
-                    };
-                    match respawn_for_uninstall(&opts, false) {
-                        Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                        Err(e) => self.error = Some(e),
-                    }
-                }
-            },
-        );
+        ui::split(root, mood, closable, rail, |body| match screen {
+            Screen::Choose => self.page_choose(body, ctx),
+            Screen::Removing => self.page_removing(body),
+            Screen::Removed => self.page_removed(body, ctx),
+            Screen::Failed => self.page_failed(body, ctx),
+        });
     }
 }
 
 impl UninstallApp {
+    fn page_choose(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context) {
+        ui::group(ui_, |g| {
+            g.add_space(12.0);
+            ui::heading(g, "Uninstall", 26.0);
+        });
+
+        let removable = self.any_removable();
+        ui::group(ui_, |g| {
+            g.add_space(20.0);
+            ui::card(g, ui::Tone::Plain, 15, |card| {
+                ui::checkbox(card, &mut self.remove_data, "Delete settings & mods");
+                if removable {
+                    card.add_space(13.0);
+                    ui::checkbox(card, &mut self.remove_games, "Delete game files");
+                    self.game_list(card);
+                }
+            });
+            if let Some(err) = &self.respawn_error {
+                g.add_space(10.0);
+                ui::paragraph(g, err, ui::text::XS, ui::DANGER_TEXT, 400.0);
+            }
+        });
+
+        let mut remove = false;
+        let mut keep = false;
+        ui::footer(ui_, |foot| {
+            ui::group(foot, |foot| {
+                ui::action_row(foot, true, |row| {
+                    remove = ui::danger_button(row, "Uninstall").clicked();
+                    row.add_space(10.0);
+                    keep = ui::secondary_button(row, "Keep it").clicked();
+                });
+            });
+        });
+
+        if keep {
+            ui::close(ctx);
+        } else if remove {
+            self.begin(ctx);
+        }
+    }
+
     fn game_list(&mut self, ui_: &mut egui::Ui) {
-        let (dirs, sizes) = self
-            .games
-            .lock()
-            .ok()
-            .map(|g| (g.dirs.clone().unwrap_or_default(), g.sizes.clone()))
-            .unwrap_or_default();
-        let color = if self.remove_games {
-            ui::DANGER_TEXT
-        } else {
-            ui::tx(0.62)
-        };
+        let ctx = ui_.ctx().clone();
+        let id = egui::Id::new("uninstall-games");
+        let open = ui::motion::tween(
+            &ctx,
+            id.with("open"),
+            ui::motion::flag(self.remove_games),
+            ui::motion::Spec::new(460, ui::motion::Curve::Out),
+        );
+        let fade = ui::motion::tween(
+            &ctx,
+            id.with("fade"),
+            ui::motion::flag(self.remove_games),
+            ui::motion::Spec::new(300, ui::motion::Curve::Ease),
+        );
+        if open <= 0.001 {
+            return;
+        }
+
+        let full = ctx.data(|d| d.get_temp::<f32>(id.with("height"))).unwrap_or(0.0);
+        let shown = (full * open).max(0.0);
+        let width = ui_.available_width();
+        let top = ui_.cursor().min;
+        let mut list = ui_.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(top, egui::vec2(width, f32::INFINITY)))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        list.set_clip_rect(
+            egui::Rect::from_min_size(top, egui::vec2(width, shown)).intersect(ui_.clip_rect()),
+        );
+        list.multiply_opacity(fade.clamp(0.0, 1.0));
+        list.spacing_mut().item_spacing.y = 0.0;
+        list.add_space(11.0);
+        let sizes = self.sizes.lock().map(|s| s.clone()).unwrap_or_default();
         egui::ScrollArea::vertical()
-            .max_height(84.0)
+            .max_height(132.0)
             .auto_shrink([false, true])
-            .show(ui_, |list| {
-                list.spacing_mut().item_spacing.y = 6.0;
-                for (i, (dir, verdict)) in dirs.iter().enumerate() {
-                    let path = dir.display().to_string();
-                    let size = match sizes.get(i).copied().flatten() {
-                        Some(bytes) => human_bytes(bytes),
-                        None => "measuring…".to_string(),
-                    };
-                    let kept = match verdict {
+            .show(&mut list, |rows| {
+                rows.spacing_mut().item_spacing.y = 6.0;
+                for (i, game) in self.games.iter().enumerate() {
+                    let kept = match game.verdict {
                         GameDirVerdict::Removable => None,
-                        GameDirVerdict::Steam => Some("Steam, kept"),
-                        GameDirVerdict::Guarded => Some("kept"),
+                        GameDirVerdict::Steam => Some("Kept by Steam"),
+                        GameDirVerdict::Guarded => Some("Kept"),
                     };
-                    let path_color = if kept.is_some() { ui::tx(0.56) } else { color };
-                    list.horizontal(|row| {
+                    let (name_color, detail, detail_color) = match kept {
+                        Some(tag) => (ui::tx(0.45), tag.to_string(), ui::tx(0.45)),
+                        None => (
+                            ui::tx(0.75),
+                            sizes
+                                .get(i)
+                                .copied()
+                                .flatten()
+                                .map(human_bytes)
+                                .unwrap_or_else(|| "…".to_string()),
+                            ui::tx(0.56),
+                        ),
+                    };
+                    rows.horizontal(|row| {
                         row.add_space(28.0);
                         row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
-                            row.label(RichText::new(size).size(ui::text::XS).color(ui::tx(0.56)));
-                            if let Some(tag) = kept {
-                                row.add_space(12.0);
-                                row.label(
-                                    RichText::new(tag).size(ui::text::XS).color(ui::tx(0.62)),
-                                );
-                            }
+                            row.label(
+                                RichText::new(detail)
+                                    .size(ui::text::SM)
+                                    .color(detail_color),
+                            );
                             row.add_space(12.0);
-                            row.add(
-                                egui::Label::new(
-                                    RichText::new(&path).size(ui::text::XS).color(path_color),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&path);
+                            row.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |row| {
+                                    row.add(
+                                        egui::Label::new(
+                                            RichText::new(game.name())
+                                                .size(ui::text::SM)
+                                                .color(name_color),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(game.path.display().to_string());
+                                },
+                            );
                         });
                     });
                 }
             });
+        let measured = list.min_rect().height();
+        ctx.data_mut(|d| d.insert_temp(id.with("height"), measured));
+        if (measured - full).abs() > 0.5 {
+            ctx.request_repaint();
+        }
+        ui_.allocate_exact_size(egui::vec2(width, shown), egui::Sense::hover());
+    }
+
+    fn page_removing(&mut self, ui_: &mut egui::Ui) {
+        ui::group(ui_, |g| {
+            g.add_space(14.0);
+            ui::heading(g, "Uninstalling", 25.0);
+        });
+        let percent = self.pacer.percent();
+        let label = self.pacer.phase().to_string();
+        ui::group(ui_, |g| {
+            g.add_space(26.0);
+            ui::progress_readout(g, &label, percent, ui::text::BASE, 12.0);
+            g.add_space(10.0);
+            ui::progress_bar(
+                g,
+                egui::Id::new("uninstall-progress"),
+                ui::bar_fraction(percent),
+                ui::BAR_STEADY,
+            );
+        });
+    }
+
+    fn page_removed(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context) {
+        let partial = !self.warnings.is_empty();
+        ui::group(ui_, |g| {
+            g.add_space(16.0);
+            ui::heading(g, if partial { "Mostly done" } else { "All done" }, 32.0);
+        });
+        let warnings = self.warnings.clone();
+        ui::group(ui_, |g| {
+            g.add_space(12.0);
+            ui::paragraph(
+                g,
+                if partial {
+                    "Some items could not be removed."
+                } else {
+                    "Hope to see you again."
+                },
+                ui::text::BODY,
+                ui::tx(0.68),
+                330.0,
+            );
+            if partial {
+                g.add_space(16.0);
+                ui::card(g, ui::Tone::Notice, 13, |card| {
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .auto_shrink([false, true])
+                        .show(card, |list| {
+                            for (i, warning) in warnings.iter().enumerate() {
+                                if i > 0 {
+                                    list.add_space(10.0);
+                                }
+                                ui::bullet_row(list, ui::NOTICE, warning);
+                            }
+                        });
+                });
+            }
+        });
+
+        let mut close = false;
+        let mut open_log = false;
+        ui::footer(ui_, |foot| {
+            ui::group(foot, |foot| {
+                ui::action_row_split(
+                    foot,
+                    |left| {
+                        if partial {
+                            open_log = ui::link(left, "Open log").clicked();
+                        }
+                    },
+                    |right| close = ui::primary_button(right, "Close").clicked(),
+                );
+            });
+        });
+        if open_log {
+            ui::open_log_folder();
+        } else if close {
+            ui::close(ctx);
+        }
+    }
+
+    fn page_failed(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context) {
+        let err = self.error.clone().unwrap_or_default();
+        ui::group(ui_, |g| {
+            g.add_space(12.0);
+            ui::heading(g, "Uninstall failed", 26.0);
+        });
+        let friendly = ui::friendly_error(&err);
+        ui::group(ui_, |g| {
+            g.add_space(18.0);
+            ui::detail_box(g, ui::Tone::Danger, "Details", &err, 170.0);
+            if !friendly.is_empty() {
+                g.add_space(10.0);
+                ui::paragraph(g, friendly, ui::text::XS, ui::tx(0.62), 400.0);
+            }
+        });
+
+        let copy_label = self.copied.label(ctx);
+        let can_retry = self.last_run.is_some();
+        let mut actions = None;
+        ui::footer(ui_, |foot| {
+            ui::group(foot, |foot| {
+                actions = Some(ui::failure_footer(foot, copy_label, can_retry));
+            });
+        });
+        let Some(actions) = actions else { return };
+
+        if actions.copy {
+            ctx.copy_text(err);
+            self.copied.mark();
+        } else if actions.open_log {
+            ui::open_log_folder();
+        } else if actions.retry {
+            if let Some(opts) = self.last_run.clone() {
+                self.start_removal(opts);
+            }
+        } else if actions.close {
+            ui::close(ctx);
+        }
     }
 }

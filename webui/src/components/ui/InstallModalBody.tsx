@@ -1,11 +1,11 @@
 ﻿// ------------ Install Dialog ------------
-// The contents of the install dialog. Lets you choose the install folder, shows free space and download size,
-// offers voice packs and resource quality where the game has them, and starts the download. Can also find a game
-// that is already on this PC.
+// The contents of the install dialog, a two-pane layout: game art with the version and a live disk summary on the
+// left; install folder, quality and voice options and the actions on the right. Games installed through Steam get
+// a short two-step guide instead. Everything it shows is preloaded before it opens so it never resizes. Can also
+// find a game that is already on this PC.
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Download,
   FolderOpen,
   HardDrive,
   Loader2,
@@ -28,9 +28,9 @@ import {
 import { SegmentedControl } from "./SegmentedControl";
 import { Hint } from "./Tooltip";
 import { Toggle } from "./Toggle";
-import { MODAL_PRIMARY, MODAL_SECONDARY } from "./modalButtons";
+import { ActionButton } from "./ActionButton";
+import { peekInstall, preloadInstall, refreshInstall, type InstallSnapshot } from "../../lib/installPreload";
 import {
-  getDefaultInstallPath,
   getDiskSpace,
   getInstallPreview,
   getContentPacks,
@@ -41,6 +41,7 @@ import {
   detectDefaultGameInstall,
   getSteamInstall,
   DEFAULT_VOICE_PACK,
+  DEFAULT_RESOURCE_QUALITY,
   RESOURCE_QUALITY_OPTIONS,
   VOICE_PACK_OPTIONS,
   type ContentPack,
@@ -50,6 +51,17 @@ import {
 } from "../../lib/ipc";
 
 const INVALID_PATH_CHARS = /[<>:"/\\|?*]/g;
+
+const SECTION_LABEL = "text-[11px] font-medium uppercase tracking-[0.6px] text-white/55";
+const CARD = "rounded-ui border border-white/[0.08] bg-white/[0.04]";
+const TEXT_LINK =
+  "flex items-center gap-[5px] text-white/75 transition-colors duration-150 hover:text-white disabled:cursor-not-allowed disabled:opacity-50";
+
+const QUALITY_DESCRIPTIONS: Record<ResourceQuality, string> = {
+  sd: "Lower-resolution textures. Smallest install.",
+  hd: "Balanced sharpness and size.",
+  uhd: "Highest-resolution textures.",
+};
 
 function folderNameFor(name: string): string {
   return name.replace(INVALID_PATH_CHARS, "").trim().replace(/[.\s]+$/, "");
@@ -74,6 +86,10 @@ function parentOf(path: string): string {
   return trimmed.slice(0, trimmed.length - leafOf(trimmed).length);
 }
 
+function driveOf(path: string): string {
+  return /^[A-Za-z]:/.test(path) ? path.slice(0, 2).toUpperCase() : "";
+}
+
 function fmtSize(bytes: number | null, approximate: boolean): string {
   if (bytes === null || bytes <= 0) return "—";
   return `${approximate ? "~" : ""}${fmtBytes(bytes)}`;
@@ -85,24 +101,75 @@ function previewReason(error: string | null): string {
   return "Could not reach the update server.";
 }
 
-function InfoLine({
+function Skeleton({ width }: { width: number }) {
+  return <span className="h-[11px] animate-pulse rounded-full bg-white/10" style={{ width }} />;
+}
+
+function SummaryLine({
   label,
   value,
   pending,
 }: {
   label: string;
-  value: string | null;
+  value: string;
   pending: boolean;
 }) {
   return (
-    <div className="flex items-center justify-between px-[12px] py-[9px]">
-      <span className="text-[12.5px] text-white/50">{label}</span>
-      {pending ? (
-        <span className="h-[11px] w-[64px] animate-pulse rounded-full bg-white/10" />
-      ) : (
-        <span className="text-[12.5px] font-medium tabular-nums text-white/80">{value || "—"}</span>
-      )}
+    <div className="flex items-center justify-between">
+      <span className="text-white/55">{label}</span>
+      {pending ? <Skeleton width={56} /> : <span className="font-medium">{value}</span>}
     </div>
+  );
+}
+
+function SpaceBar({ usedPct, installPct }: { usedPct: number; installPct: number }) {
+  return (
+    <div className="flex h-[6px] overflow-hidden rounded-full bg-white/10">
+      <div className="bg-white/30" style={{ width: `${usedPct}%` }} />
+      <div
+        className="transition-[width] duration-200"
+        style={{
+          width: `${installPct}%`,
+          background: "linear-gradient(135deg, var(--accent-a), var(--accent-b))",
+        }}
+      />
+    </div>
+  );
+}
+
+function StepRow({
+  step,
+  title,
+  text,
+  onClick,
+}: {
+  step: number;
+  title: string;
+  text: string;
+  onClick?: () => void;
+}) {
+  const body = (
+    <>
+      <span className="grid size-[24px] shrink-0 place-items-center rounded-full bg-white/10 text-[12px] font-semibold">
+        {step}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] font-medium">{title}</div>
+        <div className="text-[12px] text-white/55">{text}</div>
+      </div>
+    </>
+  );
+  const base = `flex items-center gap-[12px] px-[12px] py-[11px] text-left ${CARD}`;
+  if (!onClick) return <div className={base}>{body}</div>;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`${base} transition duration-150 hover:bg-white/[0.08] active:scale-[0.99]`}
+    >
+      {body}
+      <ExternalLink size={14} className="shrink-0 text-white/55" />
+    </button>
   );
 }
 
@@ -110,25 +177,33 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
   const game = gameById(gameId);
   const managed = isManaged(gameId);
   const push = useNotificationStore((s) => s.push);
-  const [path, setPath] = useState("");
-  const [maxRootLength, setMaxRootLength] = useState(0);
-  const [folderName, setFolderName] = useState("");
-  const [free, setFree] = useState(0);
-  const [loading, setLoading] = useState(true);
+  // Everything the dialog shows is normally loaded before it opens (see lib/installPreload), so it starts at its
+  // final size. The fallback effect below only runs when that wait timed out.
+  const [seed] = useState(() => (managed ? peekInstall(gameId) : null));
+  const [path, setPath] = useState(seed?.path ?? "");
+  const [maxRootLength, setMaxRootLength] = useState(seed?.maxRootLength ?? 0);
+  const [folderName, setFolderName] = useState(seed?.folderName ?? "");
+  const [free, setFree] = useState(seed?.free ?? 0);
+  const [totalSpace, setTotalSpace] = useState(seed?.total ?? 0);
+  const [loading, setLoading] = useState(managed && !seed);
   const [starting, setStarting] = useState(false);
   const [detecting, setDetecting] = useState(false);
-  const [preview, setPreview] = useState<InstallPreview | null>(null);
-  const [previewFailed, setPreviewFailed] = useState(false);
-  const [previewError, setPreviewError] = useState<string | null>(null);
-  const [packs, setPacks] = useState<ContentPack[] | null>(null);
-  const [packsBusy, setPacksBusy] = useState(false);
-  const [packsFailed, setPacksFailed] = useState(false);
+  const [preview, setPreview] = useState<InstallPreview | null>(seed?.preview ?? null);
+  const [previewFailed, setPreviewFailed] = useState(seed?.previewFailed ?? false);
+  const [previewError, setPreviewError] = useState<string | null>(seed?.previewError ?? null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [packs, setPacks] = useState<ContentPack[] | null>(seed?.packs ?? null);
+  const [packsFailed, setPacksFailed] = useState(seed?.packsFailed ?? false);
+  const packsRef = useRef<ContentPack[] | null>(seed?.packs ?? null);
+  const packSaves = useRef<Promise<void>>(Promise.resolve());
+  const packSavesPending = useRef(0);
+  const changed = useRef(false);
   const voice = useCustomizationStore((s) => s.voicePack[gameId]) ?? DEFAULT_VOICE_PACK;
   const setVoicePack = useCustomizationStore((s) => s.setVoicePack);
   const resourceQuality = useResourceQuality(
     gameId,
     { installed: false, steamCopy: false, jobActive: false },
-    { sizes: true },
+    { sizes: true, initial: seed?.quality ?? null },
   );
   const [qualityBusy, setQualityBusy] = useState(false);
   const previewRequest = useRef(0);
@@ -137,36 +212,72 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
   const rootLength = path.replace(/[\\/]+$/, "").length;
   const tooDeep = maxRootLength > 0 && rootLength > maxRootLength;
 
+  const applySnapshot = useCallback((snap: InstallSnapshot) => {
+    setPath(snap.path);
+    setMaxRootLength(snap.maxRootLength);
+    setFolderName(snap.folderName);
+    setFree(snap.free);
+    setTotalSpace(snap.total);
+    setPreview(snap.preview);
+    setPreviewFailed(snap.previewFailed);
+    setPreviewError(snap.previewError);
+    packsRef.current = snap.packs;
+    setPacks(snap.packs);
+    setPacksFailed(snap.packsFailed);
+    setLoading(false);
+  }, []);
+
   useEffect(() => {
-    if (!managed) return;
+    if (!managed || seed) return;
     let alive = true;
-    void (async () => {
-      const def = await getDefaultInstallPath(gameId);
-      if (alive && def?.path) setPath(def.path);
-      if (alive) setMaxRootLength(def?.maxRootLength ?? 0);
-      if (alive) setFolderName(def?.folderName ?? "");
-      const disk = await getDiskSpace(def?.path);
-      if (alive && disk) setFree(disk.free);
-      if (alive) setLoading(false);
-    })();
+    preloadInstall(gameId)
+      .then((snap) => {
+        if (alive) applySnapshot(snap);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setPreviewFailed(true);
+        setLoading(false);
+      });
     return () => {
       alive = false;
     };
-  }, [gameId, managed]);
+  }, [gameId, managed, seed, applySnapshot]);
 
-  const loadPreview = useCallback(async () => {
-    const token = ++previewRequest.current;
-    setPreview(null);
-    setPreviewFailed(false);
-    setPreviewError(null);
-    const { preview: p, error } = await getInstallPreview(gameId);
-    if (token !== previewRequest.current) return;
-    if (p && !p.notSupported) setPreview(p);
-    else {
-      setPreviewError(error);
-      setPreviewFailed(true);
-    }
-  }, [gameId]);
+  // Changing voice, quality or packs makes the cached answer out of date; fetch a fresh one for the next open.
+  useEffect(
+    () => () => {
+      if (changed.current) refreshInstall(gameId);
+    },
+    [gameId],
+  );
+
+  // A refresh keeps the numbers on screen (dimmed) until the new ones arrive, so nothing collapses into
+  // placeholders. Only a retry after a failure starts from blank.
+  const loadPreview = useCallback(
+    async (fromBlank = false) => {
+      const token = ++previewRequest.current;
+      if (fromBlank) {
+        setPreview(null);
+        setPreviewFailed(false);
+        setPreviewError(null);
+      }
+      setRefreshing(true);
+      const { preview: p, error } = await getInstallPreview(gameId);
+      if (token !== previewRequest.current) return;
+      setRefreshing(false);
+      if (p && !p.notSupported) {
+        setPreview(p);
+        setPreviewFailed(false);
+        setPreviewError(null);
+      } else {
+        setPreview(null);
+        setPreviewError(error);
+        setPreviewFailed(true);
+      }
+    },
+    [gameId],
+  );
 
   const loadPacks = useCallback(async () => {
     if (!game.contentPackChoice) return;
@@ -175,50 +286,47 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
     const r = await getContentPacks(gameId);
     if (token !== packsRequest.current || !r.supported) return;
     if (r.error) setPacksFailed(true);
-    else setPacks(r.packs);
+    else {
+      packsRef.current = r.packs;
+      setPacks(r.packs);
+    }
   }, [gameId, game.contentPackChoice]);
 
-  useEffect(() => {
-    if (!managed) return;
-    let alive = true;
-    void loadPreview().then(() => {
-      if (alive) void loadPacks();
-    });
-    return () => {
-      alive = false;
-      packsRequest.current += 1;
-    };
-  }, [managed, loadPreview, loadPacks]);
-
   const retryDetails = async () => {
-    await loadPreview();
-    if (!packs) await loadPacks();
+    await loadPreview(true);
+    if (!packsRef.current) await loadPacks();
   };
 
-  const togglePack = async (tag: string, on: boolean) => {
-    if (!packs || packsBusy) return;
-    const prev = packs;
-    const next = packs.map((p) => (p.tag === tag ? { ...p, selected: on } : p));
+  // Toggles apply instantly and are saved one after another, so flipping several quickly never blocks or
+  // dims the list. The size summary refreshes once, after the last save.
+  const togglePack = (tag: string, on: boolean) => {
+    const current = packsRef.current;
+    if (!current) return;
+    const next = current.map((p) => (p.tag === tag ? { ...p, selected: on } : p));
+    packsRef.current = next;
     setPacks(next);
-    setPacksBusy(true);
-    try {
-      const chosen = next.filter((p) => p.selected).map((p) => p.tag);
+    changed.current = true;
+    const chosen = next.filter((p) => p.selected).map((p) => p.tag);
+    packSavesPending.current += 1;
+    packSaves.current = packSaves.current.then(async () => {
       const saved = await setContentPacks(gameId, chosen.length === next.length ? null : chosen);
-      if (!saved) setPacks(prev);
-      else await loadPreview();
-    } finally {
-      setPacksBusy(false);
-    }
+      packSavesPending.current -= 1;
+      if (packSavesPending.current > 0) return;
+      if (!saved) await loadPacks();
+      await loadPreview();
+    });
   };
 
   const pickVoice = async (language: VoicePackLanguage) => {
     if (language === voice) return;
+    changed.current = true;
     await setVoicePack(gameId, language);
     await loadPreview();
   };
 
   const pickQuality = async (quality: ResourceQuality) => {
     if (quality === resourceQuality.quality || qualityBusy) return;
+    changed.current = true;
     setQualityBusy(true);
     try {
       await resourceQuality.setQuality(quality);
@@ -234,7 +342,10 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
     const target = withGameFolder(p, folderName || folderNameFor(game.name));
     setPath(target);
     const disk = await getDiskSpace(target);
-    if (disk) setFree(disk.free);
+    if (disk) {
+      setFree(disk.free);
+      setTotalSpace(disk.total);
+    }
   };
 
   const begin = () => {
@@ -293,143 +404,263 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
     }
   };
 
-  const betaNote = (spacing: string) =>
-    game.betaNote && (
-      <div
-        className={`${spacing} flex items-start gap-[9px] rounded-ui border border-(--color-warning,#fcd34d)/30 bg-(--color-warning,#fcd34d)/[0.08] px-[12px] py-[10px]`}
-      >
-        <AlertTriangle size={15} className="mt-[1px] shrink-0 text-(--color-warning,#fcd34d)" />
-        <p className="text-[12.5px] leading-[1.5] text-white/85">{game.betaNote}</p>
-      </div>
-    );
-
-  if (!managed) {
-    const steamUrl = game.installHelpUrl;
-    return (
-      <div className="p-[22px]">
-        <div className="mb-[6px] flex items-center gap-[10px]">
-          <Download size={18} className="text-white/80" />
-          <h2 className="text-[16px] font-semibold">Install {game.name}</h2>
-        </div>
-        <p className="mb-[18px] text-[13px] leading-[1.55] text-white/60">
-          {game.name} is installed and updated through Steam. Install it there, then use{" "}
-          <span className="text-white/80">Locate existing</span> to point Peebify at it.
-        </p>
-        {betaNote("mb-[18px]")}
-        <div className="flex justify-end gap-[10px]">
-          <button
-            onClick={() => void locate()}
-            className="flex items-center gap-[6px] rounded-ui border border-white/15 bg-white/[0.05] px-[14px] py-[8px] text-[13px] font-medium text-white transition duration-150 active:scale-[0.97] hover:bg-white/10"
-          >
-            <FolderSearch size={14} /> Locate existing
-          </button>
-          {steamUrl && (
-            <button
-              onClick={() => {
-                void openExternal(steamUrl);
-                onClose();
-              }}
-              className={MODAL_PRIMARY}
-            >
-              <ExternalLink size={14} /> Open in Steam
-            </button>
-          )}
-        </div>
-      </div>
-    );
-  }
+  const betaNote = (note: string) => (
+    <div className="flex items-start gap-[9px] rounded-ui border border-(--color-warning,#fcd34d)/30 bg-(--color-warning,#fcd34d)/[0.08] px-[12px] py-[10px]">
+      <AlertTriangle size={15} className="mt-[2px] shrink-0 text-(--color-warning,#fcd34d)" />
+      <p className="text-[12.5px] leading-[1.5] text-white/85">{note}</p>
+    </div>
+  );
 
   const installBytes = preview?.installBytes ?? preview?.downloadBytes ?? null;
   const requiredBytes = preview?.requiredBytes ?? installBytes;
   const shortOnSpace = requiredBytes !== null && free > 0 && free < requiredBytes;
   const includes = preview?.parts.map((p) => p.label).join(" · ") ?? "";
+  const summaryPending = !preview && !previewFailed;
+  const freeAfter = installBytes !== null && free > 0 ? Math.max(0, free - installBytes) : null;
+  const usedPct = totalSpace > 0 ? ((totalSpace - free) / totalSpace) * 100 : 0;
+  const installPct = totalSpace > 0 && installBytes !== null ? (installBytes / totalSpace) * 100 : 0;
+  const drive = driveOf(path);
+  const driveText =
+    free > 0 && totalSpace > 0
+      ? `${drive ? `${drive} · ` : ""}${fmtBytes(free)} free of ${fmtBytes(totalSpace)}`
+      : "Checking drive space…";
+
+  const identity = (
+    <div className="relative flex flex-col gap-[10px]">
+      <img
+        src={game.icon}
+        alt=""
+        className="size-[44px] rounded-ui object-cover shadow-[0_6px_16px_rgba(0,0,0,0.5)]"
+      />
+      <div>
+        <div className="font-display text-[19px] font-semibold leading-[1.2]">{game.name}</div>
+        <div className="mt-[3px] text-[12px] text-white/60">
+          {!managed ? (
+            "Distributed through Steam"
+          ) : preview?.version ? (
+            `Version ${preview.version}`
+          ) : summaryPending ? (
+            <Skeleton width={72} />
+          ) : (
+            "Version unavailable"
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  const sidebar = (
+    <aside
+      className="relative flex w-[250px] shrink-0 flex-col justify-end gap-[16px] p-[20px]"
+      style={{
+        backgroundImage: `url(${game.wallpaperStatic}), ${game.wallpaperFallback}`,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+      }}
+    >
+      <div
+        aria-hidden
+        className="absolute inset-0"
+        style={{
+          background:
+            "linear-gradient(180deg, rgba(10,10,14,0.1) 0%, rgba(10,10,14,0.55) 45%, rgba(10,10,14,0.95) 100%)",
+        }}
+      />
+      {identity}
+      {managed && (
+        <div
+          className={`relative flex flex-col gap-[9px] border-t border-white/[0.12] pt-[14px] text-[12.5px] tabular-nums transition-opacity duration-150 ${refreshing ? "opacity-60" : ""}`}
+        >
+          <SummaryLine
+            label="Download"
+            value={preview ? fmtSize(preview.downloadBytes, preview.approximate) : "—"}
+            pending={summaryPending}
+          />
+          {(!preview || preview.installBytes !== null) && (
+            <SummaryLine
+              label="Size on disk"
+              value={preview ? fmtSize(preview.installBytes, preview.approximate) : "—"}
+              pending={summaryPending}
+            />
+          )}
+          <SummaryLine
+            label="Free after install"
+            value={freeAfter !== null ? fmtBytes(freeAfter) : "—"}
+            pending={summaryPending}
+          />
+          <SpaceBar usedPct={usedPct} installPct={installPct} />
+          <div
+            className={`flex items-center gap-[6px] text-[11.5px] ${shortOnSpace ? "text-(--color-warning,#fcd34d)" : "text-white/50"}`}
+          >
+            <HardDrive size={12} className="shrink-0" />
+            <span className="min-w-0">{driveText}</span>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+
+  if (!managed) {
+    const steamUrl = game.installHelpUrl;
+    return (
+      <div className="flex">
+        {sidebar}
+        <div className="flex min-w-0 flex-1 flex-col gap-[16px] p-[22px]">
+          <h2 className="text-[16px] font-semibold leading-[1.25]">Install {game.name}</h2>
+          <p className="text-[13px] leading-[1.55] text-white/65">
+            {game.betaNote ??
+              `${game.name} is installed and updated through Steam. Install it there, then point Peebify at it.`}
+          </p>
+          <div className="flex flex-col gap-[8px]">
+            <StepRow
+              step={1}
+              title="Install in Steam"
+              text={`Find ${game.name} in your Steam library and let it finish installing.`}
+              onClick={
+                steamUrl
+                  ? () => {
+                      void openExternal(steamUrl);
+                    }
+                  : undefined
+              }
+            />
+            <StepRow
+              step={2}
+              title="Locate install"
+              text="Pick the installed folder so Peebify can launch and update it."
+            />
+          </div>
+          <div className="mt-[4px] flex justify-end gap-[10px]">
+            <ActionButton onClick={onClose}>Cancel</ActionButton>
+            <ActionButton variant="accent" onClick={() => void locate()}>
+              Locate install
+            </ActionButton>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="p-[22px]">
-      <div className="mb-[6px] flex items-center gap-[10px]">
-        <Download size={18} className="text-white/80" />
-        <h2 className="text-[16px] font-semibold">Install {game.name}</h2>
-      </div>
+    <div className="flex">
+      {sidebar}
+      <div className="flex min-w-0 flex-1 flex-col gap-[16px] p-[22px]">
+        <h2 className="text-[16px] font-semibold leading-[1.25]">Install {game.name}</h2>
 
-      <div className="mb-[6px] mt-[16px] text-[11px] font-medium uppercase tracking-[0.6px] text-white/55">
-        Install folder
-      </div>
-      <div className="mb-[12px] flex items-center gap-[10px]">
-        <Hint tip={path || undefined} className="flex min-w-0 flex-1">
-          <div className="flex min-w-0 flex-1 items-center rounded-ui border border-white/[0.08] bg-black/30 px-[12px] py-[9px] text-[12.5px]">
-            {loading || !path ? (
-              <span className="truncate text-white/80">
-                {loading ? "Resolving default location…" : "No location selected"}
-              </span>
-            ) : (
-              <>
-                <span className="truncate text-white/45">{parentOf(path)}</span>
-                <span className="shrink-0 text-white/90">{leafOf(path)}</span>
-              </>
-            )}
+        <div className="flex flex-col gap-[7px]">
+          <div className={SECTION_LABEL}>Install folder</div>
+          <div className="flex items-center gap-[8px]">
+            <Hint tip={path || undefined} className="flex min-w-0 flex-1">
+              <div className="flex min-w-0 flex-1 items-center rounded-ui border border-white/[0.08] bg-black/30 px-[12px] py-[9px] text-[12.5px]">
+                {loading || !path ? (
+                  <span className="truncate text-white/80">
+                    {loading ? "Resolving default location…" : "No location selected"}
+                  </span>
+                ) : (
+                  <>
+                    <span className="truncate text-white/45">{parentOf(path)}</span>
+                    <span className="shrink-0 text-white/90">{leafOf(path)}</span>
+                  </>
+                )}
+              </div>
+            </Hint>
+            <button
+              onClick={() => void pickFolder()}
+              className={`flex shrink-0 items-center gap-[7px] px-[12px] py-[9px] text-[12.5px] font-medium transition duration-150 active:scale-[0.97] hover:bg-white/[0.08] ${CARD}`}
+            >
+              <FolderOpen size={14} /> Browse
+            </button>
           </div>
-        </Hint>
-        <button
-          onClick={() => void pickFolder()}
-          className="flex shrink-0 items-center gap-[7px] rounded-ui border border-white/[0.08] bg-white/[0.04] px-[12px] py-[9px] text-[12.5px] font-medium transition duration-150 active:scale-[0.97] hover:bg-white/[0.08]"
-        >
-          <FolderOpen size={14} /> Browse
-        </button>
-      </div>
-
-      {betaNote("mb-[12px]")}
-
-      {game.resourceQualityChoice && (
-        <>
-          <div className="mb-[6px] text-[11px] font-medium uppercase tracking-[0.6px] text-white/55">
-            Resource quality
+          <div className="flex flex-wrap items-center gap-x-[14px] gap-y-[4px] text-[12px] text-white/50">
+            <span>Already installed?</span>
+            <button onClick={() => void locate()} className={TEXT_LINK}>
+              <FolderSearch size={13} /> Locate existing
+            </button>
+            <button disabled={detecting} onClick={() => void detectDefault()} className={TEXT_LINK}>
+              {detecting ? <Loader2 size={13} className="animate-spin" /> : <ScanSearch size={13} />}
+              Check default location
+            </button>
           </div>
-          <div role="radiogroup" aria-label="Resource quality" className="mb-[6px] grid grid-cols-3 gap-[8px]">
-            {RESOURCE_QUALITY_OPTIONS.map(({ value, label }) => {
-              const active = value === resourceQuality.quality;
-              const size = resourceQuality.sizes?.[value];
-              return (
-                <button
-                  key={value}
-                  role="radio"
-                  aria-checked={active}
-                  disabled={qualityBusy}
-                  onClick={() => void pickQuality(value)}
-                  className={`rounded-ui border px-[12px] py-[9px] text-left transition duration-150 active:scale-[0.98] disabled:cursor-wait ${
-                    active
-                      ? "border-(--accent-a) bg-white/[0.09]"
-                      : "border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.07]"
-                  }`}
-                >
-                  <div className={`text-[13px] font-semibold ${active ? "text-white" : "text-white/80"}`}>
-                    {label}
-                  </div>
-                  {size || resourceQuality.loaded ? (
-                    <div className="text-[11px] tabular-nums text-white/55">
-                      {size ? fmtBytes(size.installBytes) : "—"}
+        </div>
+
+        {game.betaNote && betaNote(game.betaNote)}
+
+        {game.resourceQualityChoice && (
+          <div className="flex flex-col gap-[7px]">
+            <div className={SECTION_LABEL}>Resource quality</div>
+            <div role="radiogroup" aria-label="Resource quality" className="grid grid-cols-3 gap-[8px]">
+              {RESOURCE_QUALITY_OPTIONS.map(({ value, label }) => {
+                const active = value === resourceQuality.quality;
+                const size = resourceQuality.sizes?.[value];
+                const share =
+                  size && free > 0 ? Math.min(100, (size.installBytes / free) * 100) : 0;
+                return (
+                  <button
+                    key={value}
+                    role="radio"
+                    aria-checked={active}
+                    disabled={qualityBusy}
+                    onClick={() => void pickQuality(value)}
+                    className={`flex flex-col gap-[2px] rounded-ui border px-[12px] pb-[12px] pt-[11px] text-left transition duration-150 active:scale-[0.98] disabled:cursor-wait ${
+                      active
+                        ? "border-(--accent-a) bg-white/[0.09]"
+                        : "border-white/[0.08] bg-white/[0.04] hover:bg-white/[0.08]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-[6px]">
+                      <span className="text-[14px] font-semibold">{label}</span>
+                      {value === DEFAULT_RESOURCE_QUALITY && (
+                        <span className="rounded-full bg-white/[0.12] px-[7px] py-px text-[10.5px] font-medium text-white/80">
+                          Default
+                        </span>
+                      )}
                     </div>
-                  ) : (
-                    <div className="mt-[4px] h-[9px] w-[44px] animate-pulse rounded-full bg-white/10" />
-                  )}
-                </button>
-              );
-            })}
+                    <div className="min-h-[34px] text-[11.5px] leading-[1.4] text-white/55">
+                      {QUALITY_DESCRIPTIONS[value]}
+                    </div>
+                    {size || resourceQuality.loaded ? (
+                      <>
+                        <div className="mt-[6px] text-[15px] font-semibold tabular-nums">
+                          {size ? fmtBytes(size.installBytes) : "—"}
+                        </div>
+                        <div className="mt-[5px] h-[4px] overflow-hidden rounded-full bg-white/10">
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: `${share}%`,
+                              background: active
+                                ? "linear-gradient(135deg, var(--accent-a), var(--accent-b))"
+                                : "rgba(255,255,255,0.35)",
+                            }}
+                          />
+                        </div>
+                        <div className="mt-[3px] text-[11px] tabular-nums text-white/50">
+                          {size ? `${fmtBytes(size.downloadBytes)} download` : "—"}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="mt-[6px] h-[15px] w-[56px] animate-pulse rounded-full bg-white/10" />
+                        <div className="mt-[5px] h-[4px] rounded-full bg-white/10" />
+                        <div className="mt-[3px] h-[9px] w-[72px] animate-pulse rounded-full bg-white/10" />
+                      </>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="text-[11.5px] leading-[1.5] text-white/50">
+              Higher quality looks sharper and needs more disk space. You can switch later in settings.
+            </div>
           </div>
-          <p className="mb-[12px] text-[11.5px] leading-[1.5] text-white/55">
-            Higher quality looks sharper but takes more disk space. You can switch later in settings.
-          </p>
-        </>
-      )}
+        )}
 
-      {game.voicePackChoice && (
-        <>
-          <div className="mb-[6px] text-[11px] font-medium uppercase tracking-[0.6px] text-white/55">
-            Voice pack
-          </div>
-          <div className="mb-[12px] flex items-center justify-between gap-[10px] rounded-ui border border-white/[0.08] bg-white/[0.04] px-[12px] py-[8px]">
-            <span className="text-[12.5px] text-white/50">
-              Audio language. You can change this later.
-            </span>
+        {game.voicePackChoice && (
+          <div className={`flex items-center justify-between gap-[12px] px-[12px] py-[9px] ${CARD}`}>
+            <div>
+              <div className="text-[12.5px] font-medium">Voice pack</div>
+              <div className="text-[11.5px] text-white/50">The language used for audio</div>
+            </div>
             <SegmentedControl
               ariaLabel="Voice-over language"
               options={VOICE_PACK_OPTIONS}
@@ -437,45 +668,51 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
               onChange={(v) => void pickVoice(v as VoicePackLanguage)}
             />
           </div>
-        </>
-      )}
+        )}
 
-      {packs && packs.length > 0 && (
-        <>
-          <div className="mb-[6px] text-[11px] font-medium uppercase tracking-[0.6px] text-white/55">
-            Voice packs
-          </div>
-          <div className="mb-[12px] overflow-hidden rounded-ui border border-white/[0.08] bg-white/[0.04] divide-y divide-white/[0.06]">
-            <div className="px-[12px] py-[8px] text-[12.5px] text-white/50">
-              Spoken audio installed with the game. You can change this later.
+        {packs && packs.length > 0 && (
+          <div className="flex flex-col gap-[7px]">
+            <div className="flex items-baseline justify-between">
+              <span className={SECTION_LABEL}>Voice packs</span>
+              <span className="text-[11.5px] text-white/50">Change them later</span>
             </div>
-            {packs.map((pack) => (
-              <div key={pack.tag} className="flex items-center justify-between gap-[10px] px-[12px] py-[7px]">
-                <div className="min-w-0">
-                  <div className="truncate text-[12.5px] font-medium text-white/80">
-                    {pack.language ?? pack.tag}
+            <div className="grid grid-cols-2 gap-[8px]">
+              {packs.map((pack) => (
+                <div
+                  key={pack.tag}
+                  className={`flex items-center justify-between gap-[8px] px-[12px] py-[8px] ${CARD}`}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-[12.5px] font-medium">{pack.language ?? pack.tag}</div>
+                    <div className="truncate text-[11px] tabular-nums text-white/50">
+                      {pack.language ? `${pack.tag} · ${fmtBytes(pack.bytes)}` : fmtBytes(pack.bytes)}
+                    </div>
                   </div>
-                  <div className="truncate text-[11px] tabular-nums text-white/55">
-                    {pack.language ? `${pack.tag} · ${fmtBytes(pack.bytes)}` : fmtBytes(pack.bytes)}
-                  </div>
+                  <Toggle
+                    checked={pack.selected}
+                    ariaLabel={pack.language ?? pack.tag}
+                    onChange={(v) => togglePack(pack.tag, v)}
+                  />
                 </div>
-                <Toggle
-                  checked={pack.selected}
-                  disabled={packsBusy}
-                  ariaLabel={pack.language ?? pack.tag}
-                  onChange={(v) => void togglePack(pack.tag, v)}
-                />
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
-        </>
-      )}
-      {!packs && packsFailed && (
-        <>
-          <div className="mb-[6px] text-[11px] font-medium uppercase tracking-[0.6px] text-white/55">
-            Voice packs
+        )}
+        {game.contentPackChoice && !packs && !packsFailed && (
+          <div className="flex flex-col gap-[7px]">
+            <div className="flex items-baseline justify-between">
+              <span className={SECTION_LABEL}>Voice packs</span>
+              <span className="text-[11.5px] text-white/50">Change them later</span>
+            </div>
+            <div className="grid grid-cols-2 gap-[8px]">
+              {[0, 1, 2, 3].map((i) => (
+                <div key={i} className={`h-[50px] animate-pulse ${CARD}`} />
+              ))}
+            </div>
           </div>
-          <div className="mb-[12px] flex items-center justify-between gap-[10px] rounded-ui border border-white/[0.08] bg-white/[0.04] px-[12px] py-[8px]">
+        )}
+        {!packs && packsFailed && (
+          <div className={`flex items-center justify-between gap-[10px] px-[12px] py-[8px] ${CARD}`}>
             <span className="text-[12.5px] text-white/50">Couldn't load the voice pack list.</span>
             <button
               onClick={() => void loadPacks()}
@@ -484,94 +721,63 @@ export function InstallModalBody({ gameId, onClose }: { gameId: GameId; onClose:
               Retry
             </button>
           </div>
-        </>
-      )}
-
-      <div className="mb-[10px] overflow-hidden rounded-ui border border-white/[0.08] bg-white/[0.04] divide-y divide-white/[0.06]">
-        <InfoLine label="Version" value={preview?.version ?? null} pending={!preview && !previewFailed} />
-        <InfoLine
-          label="Download"
-          value={preview ? fmtSize(preview.downloadBytes, preview.approximate) : null}
-          pending={!preview && !previewFailed}
-        />
-        {(!preview || preview.installBytes !== null) && (
-          <InfoLine
-            label="Size on disk"
-            value={preview ? fmtSize(preview.installBytes, preview.approximate) : null}
-            pending={!preview && !previewFailed}
-          />
         )}
-        <div className="flex items-center justify-between px-[12px] py-[9px]">
-          <span className="flex items-center gap-[7px] text-[12.5px] text-white/50">
-            <HardDrive size={13} /> Free on drive
-          </span>
-          <span
-            className={`text-[12.5px] font-medium tabular-nums ${shortOnSpace ? "text-(--color-warning,#fcd34d)" : "text-white/80"}`}
+
+        {summaryPending && (
+          <div className="py-[3px]">
+            <Skeleton width={180} />
+          </div>
+        )}
+        {(includes || previewFailed) && (
+          <div className="text-[11.5px] leading-[1.5] text-white/55">
+            {previewFailed ? (
+              <>
+                Size details unavailable. {previewReason(previewError)}{" "}
+                <button
+                  onClick={() => void retryDetails()}
+                  className="font-medium text-white/60 underline-offset-2 transition-colors duration-150 hover:text-white hover:underline"
+                >
+                  Retry
+                </button>
+              </>
+            ) : (
+              `Includes ${includes}`
+            )}
+          </div>
+        )}
+
+        {shortOnSpace && (
+          <div className="flex items-start gap-[9px] rounded-ui border border-(--color-warning,#fcd34d)/30 bg-(--color-warning,#fcd34d)/[0.08] px-[12px] py-[10px]">
+            <AlertTriangle size={15} className="mt-[1px] shrink-0 text-(--color-warning,#fcd34d)" />
+            <p className="text-[12.5px] leading-[1.5] text-white/85">
+              Needs about {fmtBytes(requiredBytes)} free while installing. Only {fmtBytes(free)} is free
+              on this drive. Pick another location or free up space first.
+            </p>
+          </div>
+        )}
+        {tooDeep && (
+          <div className="flex items-start gap-[9px] rounded-ui border border-(--color-danger,#f87171)/30 bg-(--color-danger,#f87171)/[0.08] px-[12px] py-[10px]">
+            <AlertTriangle size={15} className="mt-[1px] shrink-0 text-(--color-danger-soft,#fca5a5)" />
+            <p className="text-[12.5px] leading-[1.5] text-white/85">
+              This folder is {rootLength - maxRootLength} character
+              {rootLength - maxRootLength === 1 ? "" : "s"} too deep for {game.name}. Windows won't let
+              the game reach its own files from here, so its updates would fail after installing. Pick
+              a folder of at most {maxRootLength} characters. One directly off {"C:\\"} works.
+            </p>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-[10px]">
+          <ActionButton onClick={onClose}>Cancel</ActionButton>
+          <ActionButton
+            variant="accent"
+            disabled={!path || loading || starting || tooDeep}
+            onClick={begin}
+            icon={starting ? <Loader2 size={14} className="animate-spin" /> : undefined}
           >
-            {free > 0 ? fmtBytes(free) : "—"}
-          </span>
+            Install
+          </ActionButton>
         </div>
-      </div>
-
-      {includes && (
-        <div className="mb-[12px] text-[11.5px] leading-[1.5] text-white/55">Includes {includes}</div>
-      )}
-      {previewFailed && (
-        <div className="mb-[12px] text-[11.5px] text-white/55">
-          Size details unavailable. {previewReason(previewError)}{" "}
-          <button
-            onClick={() => void retryDetails()}
-            className="font-medium text-white/60 underline-offset-2 transition-colors duration-150 hover:text-white hover:underline"
-          >
-            Retry
-          </button>
-        </div>
-      )}
-      {shortOnSpace && (
-        <div className="mb-[12px] flex items-start gap-[9px] rounded-ui border border-(--color-warning,#fcd34d)/30 bg-(--color-warning,#fcd34d)/[0.08] px-[12px] py-[10px]">
-          <AlertTriangle size={15} className="mt-[1px] shrink-0 text-(--color-warning,#fcd34d)" />
-          <p className="text-[12.5px] leading-[1.5] text-white/85">
-            Needs about {fmtBytes(requiredBytes)} free while installing. Only {fmtBytes(free)} is free on
-            this drive. Pick another location or free up space first.
-          </p>
-        </div>
-      )}
-      {tooDeep && (
-        <div className="mb-[12px] flex items-start gap-[9px] rounded-ui border border-(--color-danger,#f87171)/30 bg-(--color-danger,#f87171)/[0.08] px-[12px] py-[10px]">
-          <AlertTriangle size={15} className="mt-[1px] shrink-0 text-(--color-danger-soft,#fca5a5)" />
-          <p className="text-[12.5px] leading-[1.5] text-white/85">
-            This folder is {rootLength - maxRootLength} character
-            {rootLength - maxRootLength === 1 ? "" : "s"} too deep for {game.name}. Windows won't let
-            the game reach its own files from here, so its updates would fail after installing. Pick
-            a folder of at most {maxRootLength} characters. One directly off {"C:\\"} works.
-          </p>
-        </div>
-      )}
-
-      <div className="mb-[16px] flex gap-[10px]">
-        <button
-          onClick={() => void locate()}
-          className="flex flex-1 items-center justify-center gap-[7px] rounded-ui border border-white/[0.08] bg-white/[0.03] py-[9px] text-[12.5px] font-medium text-white/70 transition duration-150 active:scale-[0.97] hover:bg-white/[0.07]"
-        >
-          <FolderSearch size={14} /> Locate existing install
-        </button>
-        <button
-          disabled={detecting}
-          onClick={() => void detectDefault()}
-          className="flex flex-1 items-center justify-center gap-[7px] rounded-ui border border-white/[0.08] bg-white/[0.03] py-[9px] text-[12.5px] font-medium text-white/70 transition duration-150 active:scale-[0.97] hover:bg-white/[0.07] disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {detecting ? <Loader2 size={14} className="animate-spin" /> : <ScanSearch size={14} />} Check default
-          location
-        </button>
-      </div>
-
-      <div className="flex justify-end gap-[10px]">
-        <button onClick={onClose} className={MODAL_SECONDARY}>
-          Cancel
-        </button>
-        <button disabled={!path || loading || starting || tooDeep} onClick={begin} className={MODAL_PRIMARY}>
-          {starting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />} Install
-        </button>
       </div>
     </div>
   );

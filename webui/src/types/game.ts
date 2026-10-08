@@ -12,7 +12,10 @@ export type GameId =
   | "gf2"
   | "gf1"
   | "re1999"
-  | "bd2";
+  | "bd2"
+  | "arknights"
+  | "bluearchive"
+  | "dna";
 
 export type GraphicsApi = "dx11" | "dx12";
 

@@ -672,7 +672,8 @@ pub mod front_end {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
-    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowThreadProcessId, IsWindow, IsWindowVisible, ShowWindow, SW_HIDE,
         SW_RESTORE,

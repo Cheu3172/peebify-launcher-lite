@@ -1543,6 +1543,9 @@ mod tests {
             "gf1": { "gamePath": "", "launchViaSteam": true, "playtime": default_playtime_full() },
             "re1999": { "gamePath": "", "playtime": default_playtime_full() },
             "bd2": { "gamePath": "", "playtime": default_playtime_full() },
+            "arknights": { "gamePath": "", "graphicsApi": "dx11", "playtime": default_playtime_full() },
+            "bluearchive": { "gamePath": "", "launchViaSteam": true, "playtime": default_playtime_full() },
+            "dna": { "gamePath": "", "graphicsApi": "dx12", "playtime": default_playtime_full() },
         });
         let defaults = default_config();
         assert_eq!(defaults["games"], expected);

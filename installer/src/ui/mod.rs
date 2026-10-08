@@ -1,12 +1,13 @@
 // ------------ Setup Window Kit ------------
 // The shared look of the setup windows, drawn with egui: Peebify colors and fonts, wallpaper backdrop, titlebar,
-// step rail, buttons, cards and the progress bar. The install wizard, uninstall window and splash all use it.
+// step rail, buttons, cards and the progress bar, plus the v2 motion. The install wizard and uninstall window use it.
 
-pub mod splash;
 pub mod uninstall;
 pub mod wizard;
 
 use eframe::egui::{self, Color32, CornerRadius, RichText};
+
+use motion::{Curve, Spec};
 
 pub const LOGO_PNG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -26,7 +27,6 @@ pub mod text {
 }
 
 pub const WINDOW: [f32; 2] = [820.0, 540.0];
-pub const SPLASH: [f32; 2] = [520.0, 232.0];
 
 const RAIL_W: f32 = 312.0;
 const RAIL_PAD_X: f32 = 26.0;
@@ -35,9 +35,6 @@ const RAIL_PAD_BOTTOM: f32 = 28.0;
 const PANEL_PAD_X: f32 = 38.0;
 const PANEL_PAD_TOP: f32 = 34.0;
 const PANEL_PAD_BOTTOM: f32 = 30.0;
-const SPLASH_PAD_X: f32 = 28.0;
-const SPLASH_PAD_TOP: f32 = 28.0;
-const SPLASH_PAD_BOTTOM: f32 = 26.0;
 
 pub const BG: Color32 = Color32::from_rgb(0x0b, 0x0c, 0x14);
 pub const TEXT: Color32 = Color32::from_rgb(0xe9, 0xe9, 0xed);
@@ -45,6 +42,7 @@ pub const NOTICE: Color32 = Color32::from_rgb(0xe8, 0xb4, 0x4c);
 pub const DANGER: Color32 = Color32::from_rgb(0xe0, 0x65, 0x5f);
 pub const DANGER_TEXT: Color32 = Color32::from_rgb(0xff, 0x9b, 0x95);
 const PANEL_TINT: Color32 = Color32::from_rgb(0x0e, 0x0f, 0x18);
+const INK: Color32 = Color32::from_rgb(0x12, 0x13, 0x1e);
 
 const SEMIBOLD: &str = "peebify-semibold";
 
@@ -52,10 +50,249 @@ pub fn tx(alpha: f32) -> Color32 {
     TEXT.gamma_multiply(alpha)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Surface {
-    Install,
-    Uninstall,
+// ------------ Motion ------------
+// Easing curves and tweens for state changes (stepper, badge, mood). Screens and text appear instantly. With
+// Windows animations turned off, every tween becomes a short fade with no movement.
+pub mod motion {
+    use eframe::egui;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub enum Curve {
+        Linear,
+        Ease,
+        Out,
+        Spring,
+        InOut,
+        Sine,
+    }
+
+    fn bezier(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
+        let sample = |a1: f32, a2: f32, t: f32| {
+            let u = 1.0 - t;
+            3.0 * u * u * t * a1 + 3.0 * u * t * t * a2 + t * t * t
+        };
+        let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+        let mut t = x;
+        for _ in 0..24 {
+            let guess = sample(x1, x2, t);
+            if (guess - x).abs() < 1e-5 {
+                break;
+            }
+            if guess < x {
+                lo = t;
+            } else {
+                hi = t;
+            }
+            t = (lo + hi) / 2.0;
+        }
+        sample(y1, y2, t)
+    }
+
+    impl Curve {
+        pub fn at(self, t: f32) -> f32 {
+            let t = t.clamp(0.0, 1.0);
+            if t <= 0.0 || t >= 1.0 {
+                return t;
+            }
+            match self {
+                Curve::Linear => t,
+                Curve::Ease => bezier(0.25, 0.1, 0.25, 1.0, t),
+                Curve::Out => bezier(0.22, 1.0, 0.36, 1.0, t),
+                Curve::Spring => bezier(0.34, 1.56, 0.64, 1.0, t),
+                Curve::InOut => bezier(0.65, 0.0, 0.35, 1.0, t),
+                Curve::Sine => bezier(0.42, 0.0, 0.58, 1.0, t),
+            }
+        }
+    }
+
+    pub fn reduced() -> bool {
+        static REDUCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *REDUCED.get_or_init(|| !crate::win::animations_enabled())
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub struct Spec {
+        pub secs: f32,
+        pub delay: f32,
+        pub curve: Curve,
+    }
+
+    impl Spec {
+        pub const fn new(ms: u32, curve: Curve) -> Self {
+            Self {
+                secs: ms as f32 / 1000.0,
+                delay: 0.0,
+                curve,
+            }
+        }
+
+        pub const fn after(self, ms: u32) -> Self {
+            Self {
+                delay: ms as f32 / 1000.0,
+                ..self
+            }
+        }
+
+        fn effective(self) -> Self {
+            if reduced() && self.secs > 0.0 {
+                Self::new(160, Curve::Linear)
+            } else {
+                self
+            }
+        }
+
+        pub fn at(self, elapsed: f32) -> f32 {
+            let spec = self.effective();
+            if elapsed < spec.delay {
+                return 0.0;
+            }
+            if spec.secs <= 0.0 {
+                return 1.0;
+            }
+            spec.curve.at((elapsed - spec.delay) / spec.secs)
+        }
+
+        pub fn total(self) -> f32 {
+            let spec = self.effective();
+            spec.delay + spec.secs
+        }
+    }
+
+    pub fn now(ctx: &egui::Context) -> f64 {
+        ctx.input(|i| i.time)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Tween {
+        from: f32,
+        to: f32,
+        start: f64,
+        spec: Spec,
+    }
+
+    impl Tween {
+        fn value(&self, now: f64) -> f32 {
+            let k = self.spec.at((now - self.start) as f32);
+            self.from + (self.to - self.from) * k
+        }
+    }
+
+    pub fn tween(ctx: &egui::Context, id: egui::Id, target: f32, spec: Spec) -> f32 {
+        let now = now(ctx);
+        let tween = ctx.data_mut(|d| {
+            let tween = match d.get_temp::<Tween>(id) {
+                Some(tween) if tween.to == target => tween,
+                Some(tween) => Tween {
+                    from: tween.value(now),
+                    to: target,
+                    start: now,
+                    spec,
+                },
+                None => Tween {
+                    from: target,
+                    to: target,
+                    start: now,
+                    spec,
+                },
+            };
+            d.insert_temp(id, tween);
+            tween
+        });
+        if ((now - tween.start) as f32) < tween.spec.total() {
+            ctx.request_repaint();
+        }
+        tween.value(now)
+    }
+
+    pub fn flag(on: bool) -> f32 {
+        if on {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    pub fn drift(ctx: &egui::Context) -> f32 {
+        if reduced() {
+            return 0.0;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        let t = (now(ctx) % 80.0) as f32;
+        let swing = if t < 40.0 { t / 40.0 } else { 2.0 - t / 40.0 };
+        Curve::Sine.at(swing)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Curve;
+
+        #[test]
+        fn curves_start_and_end_on_their_targets() {
+            for curve in [
+                Curve::Linear,
+                Curve::Ease,
+                Curve::Out,
+                Curve::Spring,
+                Curve::InOut,
+                Curve::Sine,
+            ] {
+                assert_eq!(curve.at(0.0), 0.0);
+                assert_eq!(curve.at(1.0), 1.0);
+            }
+        }
+
+        #[test]
+        fn spring_overshoots_and_out_front_loads() {
+            assert!((0.0..1.0).any_sample(|t| Curve::Spring.at(t) > 1.0));
+            assert!(Curve::Out.at(0.3) > 0.7);
+            assert!((Curve::Sine.at(0.5) - 0.5).abs() < 1e-3);
+        }
+
+        trait AnySample {
+            fn any_sample(self, f: impl Fn(f32) -> bool) -> bool;
+        }
+
+        impl AnySample for std::ops::Range<f32> {
+            fn any_sample(self, f: impl Fn(f32) -> bool) -> bool {
+                (0..100).any(|i| f(self.start + (self.end - self.start) * i as f32 / 100.0))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Mood {
+    pub brightness: f32,
+    pub saturation: f32,
+    pub dim: f32,
+}
+
+impl Mood {
+    const fn new(brightness: f32, saturation: f32, dim: f32) -> Self {
+        Self {
+            brightness,
+            saturation,
+            dim,
+        }
+    }
+
+    pub const CALM: Mood = Mood::new(1.0, 1.0, 0.0);
+    pub const INSTALLING: Mood = Mood::new(0.88, 0.95, 0.08);
+    pub const DONE: Mood = Mood::new(1.06, 1.1, 0.0);
+    pub const FAILED: Mood = Mood::new(0.8, 0.35, 0.12);
+    pub const UNINSTALL: Mood = Mood::new(0.9, 0.6, 0.06);
+    pub const REMOVING: Mood = Mood::new(0.85, 0.5, 0.12);
+    pub const REMOVED: Mood = Mood::new(0.85, 0.4, 0.14);
+
+    fn eased(self, ctx: &egui::Context) -> Self {
+        let filter = Spec::new(1000, Curve::Out);
+        let id = egui::Id::new("peebify-mood");
+        Self {
+            brightness: motion::tween(ctx, id.with("b"), self.brightness, filter),
+            saturation: motion::tween(ctx, id.with("s"), self.saturation, filter),
+            dim: motion::tween(ctx, id.with("d"), self.dim, Spec::new(900, Curve::Out)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -64,36 +301,27 @@ pub enum Close {
     Disabled,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 pub enum Step {
     Setup,
     Install,
     Ready,
 }
 
-#[derive(Clone, Copy)]
-pub struct Scrim {
-    pub top: f32,
-    pub bottom: f32,
+#[derive(Clone, Copy, PartialEq)]
+pub enum Badge {
+    None,
+    Done,
+    Failed,
 }
-
-impl Scrim {
-    pub const fn new(top: f32, bottom: f32) -> Self {
-        Self { top, bottom }
-    }
-}
-
-pub const SCRIM_DEFAULT: Scrim = Scrim::new(0.50, 0.72);
-pub const SCRIM_DONE: Scrim = Scrim::new(0.44, 0.70);
-pub const SCRIM_FAILED: Scrim = Scrim::new(0.62, 0.80);
-pub const SCRIM_UNINSTALL: Scrim = Scrim::new(0.56, 0.78);
-pub const SCRIM_SPLASH: Scrim = Scrim::new(0.60, 0.88);
 
 pub struct Rail<'a> {
     pub step: Option<Step>,
-    pub error: Option<&'a str>,
+    pub progress: f32,
+    pub error: bool,
+    pub muted: bool,
+    pub badge: Badge,
     pub logo: Option<&'a egui::TextureHandle>,
-    pub logo_alpha: f32,
     pub identity: String,
 }
 
@@ -101,9 +329,11 @@ impl<'a> Rail<'a> {
     pub fn new(logo: Option<&'a egui::TextureHandle>, identity: impl Into<String>) -> Self {
         Self {
             step: None,
-            error: None,
+            progress: 0.0,
+            error: false,
+            muted: false,
+            badge: Badge::None,
             logo,
-            logo_alpha: 1.0,
             identity: identity.into(),
         }
     }
@@ -113,13 +343,25 @@ impl<'a> Rail<'a> {
         self
     }
 
-    pub fn error(mut self, label: &'a str) -> Self {
-        self.error = Some(label);
+    pub fn progress(mut self, fraction: f32) -> Self {
+        self.progress = fraction.clamp(0.0, 1.0);
         self
     }
 
-    pub fn logo_alpha(mut self, alpha: f32) -> Self {
-        self.logo_alpha = alpha;
+    pub fn failed(mut self) -> Self {
+        self.error = true;
+        self.muted = true;
+        self.badge = Badge::Failed;
+        self
+    }
+
+    pub fn muted(mut self) -> Self {
+        self.muted = true;
+        self
+    }
+
+    pub fn badge(mut self, badge: Badge) -> Self {
+        self.badge = badge;
         self
     }
 }
@@ -151,7 +393,7 @@ pub struct Chrome {
 impl Chrome {
     pub fn apply(&mut self) {
         if !self.applied {
-            self.applied = crate::win::round_own_windows();
+            self.applied = crate::win::style_own_windows();
         }
     }
 }
@@ -231,13 +473,17 @@ pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
         .color(Color32::WHITE)
 }
 
+pub fn semibold_font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(SEMIBOLD.into()))
+}
+
 pub fn heading(ui: &mut egui::Ui, text: &str, size: f32) {
     ui.label(semibold(text, size));
 }
 
 pub fn apply_theme(ctx: &egui::Context) {
     install_fonts(ctx);
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     let mut visuals = egui::Visuals::dark();
     visuals.override_text_color = Some(TEXT);
     visuals.panel_fill = Color32::TRANSPARENT;
@@ -262,11 +508,12 @@ pub fn apply_theme(ctx: &egui::Context) {
     style.interaction.selectable_labels = false;
     style.spacing.button_padding = egui::vec2(16.0, 8.0);
     style.spacing.item_spacing.y = 6.0;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 // ------------ Backdrop And Titlebar ------------
-// Loads the logo and wallpaper and paints the frosted backdrop, the drag strip and the minimize and close buttons.
+// Loads the logo and wallpaper and paints the backdrop: the slow drift, the per screen mood (brightness, saturation,
+// dim) and the frosted pane, then the drag strip and the minimize and close buttons.
 pub fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let (rgba, width, height) = logo_rgba();
     if rgba.is_empty() {
@@ -277,24 +524,61 @@ pub fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("peebify-logo", color, egui::TextureOptions::LINEAR))
 }
 
-fn texture(ctx: &egui::Context, key: &'static str, bytes: &[u8]) -> Option<egui::TextureHandle> {
-    let id = egui::Id::new(key);
+fn grayscale(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .flat_map(|px| {
+            let luma = 0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32;
+            let l = luma.round().clamp(0.0, 255.0) as u8;
+            [l, l, l, px[3]]
+        })
+        .collect()
+}
+
+fn gray_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let id = egui::Id::new("peebify-logo-gray");
     if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
         return Some(tex);
     }
-    let rgba = image::load_from_memory(bytes).ok()?.into_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let color = egui::ColorImage::from_rgba_unmultiplied(size, &rgba.into_raw());
-    let tex = ctx.load_texture(key, color, egui::TextureOptions::LINEAR);
+    let (rgba, width, height) = logo_rgba();
+    if rgba.is_empty() {
+        return None;
+    }
+    let size = [*width as usize, *height as usize];
+    let gray = egui::ColorImage::from_rgba_unmultiplied(size, &grayscale(rgba));
+    let tex = ctx.load_texture("peebify-logo-gray", gray, egui::TextureOptions::LINEAR);
     ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
     Some(tex)
 }
 
-fn wallpaper(ctx: &egui::Context, blurred: bool) -> Option<egui::TextureHandle> {
+#[derive(Clone)]
+struct Wall {
+    color: egui::TextureHandle,
+    gray: egui::TextureHandle,
+}
+
+fn wall_textures(ctx: &egui::Context, key: &'static str, bytes: &[u8]) -> Option<Wall> {
+    let id = egui::Id::new(key);
+    if let Some(wall) = ctx.data(|d| d.get_temp::<Wall>(id)) {
+        return Some(wall);
+    }
+    let rgba = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let raw = rgba.into_raw();
+    let gray = egui::ColorImage::from_rgba_unmultiplied(size, &grayscale(&raw));
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, &raw);
+    let wall = Wall {
+        color: ctx.load_texture(key, color, egui::TextureOptions::LINEAR),
+        gray: ctx.load_texture(format!("{key}-gray"), gray, egui::TextureOptions::LINEAR),
+    };
+    ctx.data_mut(|d| d.insert_temp(id, wall.clone()));
+    Some(wall)
+}
+
+fn wallpaper(ctx: &egui::Context, blurred: bool) -> Option<Wall> {
     if blurred {
-        texture(ctx, "wall-blur", WALLPAPER_BLUR_JPG)
+        wall_textures(ctx, "wall-blur", WALLPAPER_BLUR_JPG)
     } else {
-        texture(ctx, "wall", WALLPAPER_JPG)
+        wall_textures(ctx, "wall", WALLPAPER_JPG)
     }
 }
 
@@ -353,55 +637,58 @@ fn panel_color(alpha: f32) -> Color32 {
     )
 }
 
-fn paint_backdrop(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    scrim: Scrim,
-    focus: (f32, f32),
-) -> Option<egui::Rect> {
-    let ctx = ui.ctx().clone();
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, BG);
-    let uv = wallpaper(&ctx, false).map(|tex| {
-        let uv = cover_uv(tex.size_vec2(), rect, focus);
-        egui::Image::new(&tex).uv(uv).paint_at(ui, rect);
-        uv
-    });
-    vertical_gradient(
-        ui.painter(),
-        rect,
-        &[
-            (0.0, scrim_color(scrim.top)),
-            (1.0, scrim_color(scrim.bottom)),
-        ],
-    );
-    uv
+const SCRIM_TOP: f32 = 0.50;
+const SCRIM_BOTTOM: f32 = 0.72;
+const WALL_FOCUS: (f32, f32) = (0.32, 0.5);
+
+fn wall_rect(window: egui::Rect, scale: f32, drift: f32) -> egui::Rect {
+    let grow = scale * (1.0 + 0.06 * drift);
+    let shift = egui::vec2(-0.014 * window.width(), -0.008 * window.height()) * drift * grow;
+    egui::Rect::from_center_size(window.center() + shift, window.size() * grow)
 }
 
-fn frost(
-    ui: &mut egui::Ui,
-    window: egui::Rect,
-    panel: egui::Rect,
-    uv: Option<egui::Rect>,
-    scrim: Scrim,
-) {
-    if let (Some(uv), Some(tex)) = (uv, wallpaper(ui.ctx(), true)) {
-        let fx = (panel.min.x - window.min.x) / window.width();
-        let sub = egui::Rect::from_min_max(
-            egui::pos2(uv.min.x + uv.width() * fx, uv.min.y),
-            egui::pos2(uv.max.x, uv.max.y),
-        );
-        egui::Image::new(&tex).uv(sub).paint_at(ui, panel);
-        vertical_gradient(
-            ui.painter(),
-            panel,
-            &[
-                (0.0, scrim_color(scrim.top)),
-                (1.0, scrim_color(scrim.bottom)),
-            ],
+fn paint_wall(painter: &egui::Painter, wall: &Wall, dest: egui::Rect, uv: egui::Rect, mood: Mood) {
+    let level = (mood.brightness.min(1.0) * 255.0).round() as u8;
+    let tint = Color32::from_gray(level);
+    let saturation = mood.saturation.clamp(0.0, 1.0);
+    if saturation < 0.999 {
+        painter.image(wall.gray.id(), dest, uv, tint);
+    }
+    if saturation > 0.001 {
+        painter.image(wall.color.id(), dest, uv, tint.gamma_multiply(saturation));
+    }
+    if mood.brightness > 1.0 {
+        let lift = ((mood.brightness - 1.0) * 0.45 * 255.0).round() as u8;
+        painter.rect_filled(
+            dest,
+            CornerRadius::ZERO,
+            Color32::from_rgba_premultiplied(lift, lift, lift, 0),
         );
     }
+}
+
+fn paint_backdrop(ui: &egui::Ui, window: egui::Rect, panel: egui::Rect, mood: Mood) {
+    let ctx = ui.ctx().clone();
+    let mood = mood.eased(&ctx);
+    let drift = motion::drift(&ctx);
+    let painter = ui.painter().with_clip_rect(window);
+    painter.rect_filled(window, CornerRadius::ZERO, BG);
+
+    if let Some(wall) = wallpaper(&ctx, false) {
+        let uv = cover_uv(wall.color.size_vec2(), window, WALL_FOCUS);
+        paint_wall(&painter, &wall, wall_rect(window, 1.0, drift), uv, mood);
+    }
+    let scrim = [(0.0, scrim_color(SCRIM_TOP)), (1.0, scrim_color(SCRIM_BOTTOM))];
+    vertical_gradient(&painter, window, &scrim);
+
+    let pane = painter.with_clip_rect(panel);
+    if let Some(wall) = wallpaper(&ctx, true) {
+        let uv = cover_uv(wall.color.size_vec2(), window, WALL_FOCUS);
+        paint_wall(&pane, &wall, wall_rect(window, 1.08, drift), uv, mood);
+        vertical_gradient(&pane, panel, &scrim);
+    }
     horizontal_gradient(
-        ui.painter(),
+        &pane,
         panel,
         &[
             (0.0, panel_color(0.28)),
@@ -410,7 +697,7 @@ fn frost(
         ],
     );
     vertical_gradient(
-        ui.painter(),
+        &pane,
         egui::Rect::from_min_max(panel.min, egui::pos2(panel.min.x + 1.0, panel.max.y)),
         &[
             (0.0, Color32::TRANSPARENT),
@@ -419,6 +706,9 @@ fn frost(
             (1.0, Color32::TRANSPARENT),
         ],
     );
+    if mood.dim > 0.001 {
+        painter.rect_filled(window, CornerRadius::ZERO, scrim_color(mood.dim));
+    }
 }
 
 fn drag_strip(ui: &mut egui::Ui, ctx: &egui::Context, rect: egui::Rect, id: &'static str) {
@@ -469,7 +759,14 @@ fn close_button(ui: &mut egui::Ui, ctx: &egui::Context, window: egui::Rect, enab
         },
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "Close"));
-    let painter = ui.painter();
+    let presence = motion::tween(
+        ctx,
+        egui::Id::new("titlebar-close-presence"),
+        if enabled { 1.0 } else { 0.3 },
+        Spec::new(300, Curve::Ease),
+    );
+    let mut painter = ui.painter().clone();
+    painter.multiply_opacity(presence);
     let icon = if enabled && response.hovered() {
         painter.rect_filled(
             btn,
@@ -477,10 +774,8 @@ fn close_button(ui: &mut egui::Ui, ctx: &egui::Context, window: egui::Rect, enab
             Color32::from_rgba_unmultiplied(0xe0, 0x65, 0x5f, 190),
         );
         Color32::WHITE
-    } else if enabled {
-        tx(0.55)
     } else {
-        tx(0.22)
+        tx(0.55)
     };
     let c = btn.center();
     let r = 4.0;
@@ -493,90 +788,196 @@ fn close_button(ui: &mut egui::Ui, ctx: &egui::Context, window: egui::Rect, enab
         [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
         stroke,
     );
-    focus_ring(painter, btn, 5, response.has_focus());
-    if !enabled {
-        response.on_hover_text("Setup is working. Please wait until it finishes.");
-        return;
+    focus_ring(&painter, btn, 5, response.has_focus());
+    if enabled && response.clicked() {
+        close(ctx);
     }
-    if response.clicked() {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+const CLOSE_NOW: &str = "peebify-close-now";
+
+pub fn close(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(CLOSE_NOW), true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+fn hold_close(ctx: &egui::Context, closable: Close) {
+    let release = ctx.data(|d| d.get_temp::<bool>(egui::Id::new(CLOSE_NOW))) == Some(true);
+    if ctx.input(|i| i.viewport().close_requested()) && !release && closable == Close::Disabled {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
 }
 
 const STEP_ROW: f32 = 17.0;
 const STEP_LINK: f32 = 16.0;
 const DOT: f32 = 7.0;
+const STEPS: [(Step, &str); 3] = [
+    (Step::Setup, "Setup"),
+    (Step::Install, "Install"),
+    (Step::Ready, "Ready"),
+];
 
 // ------------ Step Rail And Layouts ------------
-// The left rail that shows Setup, Install and Ready, and the two page layouts built around it.
-fn connector_alphas(step: Step, index: usize) -> (f32, f32) {
-    match (step, index) {
-        (Step::Setup, 0) => (0.30, 0.10),
-        (Step::Setup, _) => (0.14, 0.06),
-        (Step::Install, 0) => (0.14, 0.30),
-        (Step::Install, _) => (0.14, 0.06),
-        (Step::Ready, 0) => (0.14, 0.20),
-        (Step::Ready, _) => (0.20, 0.30),
-    }
+// The left rail with the animated Setup, Install and Ready stepper, the error tag and the logo badge, and the split
+// layout built around it.
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        l(a.r(), b.r()),
+        l(a.g(), b.g()),
+        l(a.b(), b.b()),
+        l(a.a(), b.a()),
+    )
 }
 
-fn step_row(ui: &egui::Ui, x: f32, y: f32, label: &str, color: Color32, filled: bool) {
-    let painter = ui.painter();
-    let center = egui::pos2(x + DOT / 2.0, y + STEP_ROW / 2.0);
-    if filled {
-        painter.circle_filled(center, DOT / 2.0, color);
-    } else {
-        painter.circle_stroke(center, DOT / 2.0 - 0.5, egui::Stroke::new(1.0, tx(0.30)));
-    }
-    let galley = ui.fonts(|f| {
-        f.layout_no_wrap(
-            label.to_owned(),
-            egui::FontId::new(text::MD, egui::FontFamily::Proportional),
-            color,
-        )
-    });
-    painter.galley(
-        egui::pos2(x + DOT + 11.0, y + (STEP_ROW - galley.size().y) / 2.0),
-        galley,
+fn paint_label(painter: &egui::Painter, pos: egui::Pos2, label: &str, color: Color32) {
+    let galley = painter.layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::new(text::MD, egui::FontFamily::Proportional),
         color,
     );
+    let y = pos.y + (STEP_ROW - galley.size().y) / 2.0;
+    painter.galley(egui::pos2(pos.x + DOT + 11.0, y), galley, color);
 }
 
-fn paint_rail(ui: &mut egui::Ui, rail_rect: egui::Rect, rail: &Rail) {
-    let x = rail_rect.min.x + RAIL_PAD_X;
-    let mut y = rail_rect.min.y + RAIL_PAD_TOP;
-
-    if let Some(label) = rail.error {
-        step_row(ui, x, y, label, DANGER, true);
-    } else if let Some(active) = rail.step {
-        for (i, (step, label)) in [
-            (Step::Setup, "Setup"),
-            (Step::Install, "Install"),
-            (Step::Ready, "Ready"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let on = step == active;
-            step_row(
-                ui,
-                x,
-                y,
-                label,
-                if on { Color32::WHITE } else { tx(0.40) },
-                on,
-            );
-            y += STEP_ROW;
-            if i < 2 {
-                let (a, b) = connector_alphas(active, i);
-                vertical_gradient(
-                    ui.painter(),
-                    egui::Rect::from_min_size(egui::pos2(x + 3.0, y), egui::vec2(1.0, STEP_LINK)),
-                    &[(0.0, tx(a)), (1.0, tx(b))],
-                );
-                y += STEP_LINK;
+fn paint_stepper(painter: &egui::Painter, x: f32, y: f32, step: Step, progress: f32) {
+    let ctx = painter.ctx().clone();
+    let id = egui::Id::new("peebify-stepper");
+    let dot_fade = Spec::new(260, Curve::Ease).after(120);
+    let dot_pop = Spec::new(520, Curve::Spring).after(120);
+    let grow = Spec::new(420, Curve::Out);
+    let fills = [
+        motion::tween(&ctx, id.with("c1"), motion::flag(step >= Step::Install), grow),
+        match step {
+            Step::Install => {
+                motion::tween(&ctx, id.with("c2"), progress, Spec::new(160, Curve::Linear))
             }
+            Step::Ready => motion::tween(&ctx, id.with("c2"), 1.0, grow),
+            Step::Setup => motion::tween(&ctx, id.with("c2"), 0.0, grow),
+        },
+    ];
+
+    let mut row_y = y;
+    for (i, (this, label)) in STEPS.into_iter().enumerate() {
+        let on = motion::flag(this == step);
+        let center = egui::pos2(x + DOT / 2.0, row_y + STEP_ROW / 2.0);
+        painter.circle_stroke(center, DOT / 2.0 - 0.5, egui::Stroke::new(1.0, tx(0.30)));
+        let fade = motion::tween(&ctx, id.with(("dot", i)), on, dot_fade);
+        let pop = motion::tween(&ctx, id.with(("pop", i)), on, dot_pop);
+        let scale = if motion::reduced() { 1.0 } else { 0.2 + 0.8 * pop };
+        if fade > 0.001 {
+            painter.circle_filled(
+                center,
+                (DOT / 2.0 * scale).max(0.0),
+                Color32::WHITE.gamma_multiply(fade.clamp(0.0, 1.0)),
+            );
         }
+        let lit = motion::tween(&ctx, id.with(("label", i)), on, Spec::new(400, Curve::Ease));
+        paint_label(painter, egui::pos2(x, row_y), label, lerp_color(tx(0.40), Color32::WHITE, lit));
+        row_y += STEP_ROW;
+        if let Some(fill) = fills.get(i) {
+            let link = egui::Rect::from_min_size(egui::pos2(x + 3.0, row_y), egui::vec2(1.0, STEP_LINK));
+            painter.rect_filled(link, CornerRadius::ZERO, tx(0.14));
+            if *fill > 0.001 {
+                let mut lit = link;
+                lit.set_height(STEP_LINK * fill.clamp(0.0, 1.0));
+                painter.rect_filled(lit, CornerRadius::ZERO, tx(0.55));
+            }
+            row_y += STEP_LINK;
+        }
+    }
+}
+
+fn badge_pop(ctx: &egui::Context, id: egui::Id, show: bool, delay: u32) -> (f32, f32, f32) {
+    let on = motion::flag(show);
+    let fade = if show {
+        Spec::new(220, Curve::Ease).after(delay)
+    } else {
+        Spec::new(160, Curve::Ease)
+    };
+    let pop = if show {
+        Spec::new(600, Curve::Spring).after(delay)
+    } else {
+        Spec::new(0, Curve::Linear).after(180)
+    };
+    let stroke = if show {
+        Spec::new(420, Curve::InOut).after(delay + 220)
+    } else {
+        Spec::new(0, Curve::Linear).after(180)
+    };
+    (
+        motion::tween(ctx, id.with("fade"), on, fade).clamp(0.0, 1.0),
+        if motion::reduced() {
+            1.0
+        } else {
+            0.4 + 0.6 * motion::tween(ctx, id.with("pop"), on, pop)
+        },
+        motion::tween(ctx, id.with("stroke"), on, stroke).clamp(0.0, 1.0),
+    )
+}
+
+fn partial_path(points: &[egui::Pos2], fraction: f32) -> Vec<egui::Pos2> {
+    let total: f32 = points.windows(2).map(|w| w[0].distance(w[1])).sum();
+    let mut left = total * fraction.clamp(0.0, 1.0);
+    let mut out = vec![points[0]];
+    for w in points.windows(2) {
+        let len = w[0].distance(w[1]);
+        if left >= len {
+            out.push(w[1]);
+            left -= len;
+        } else {
+            if left > 0.0 {
+                out.push(w[0] + (w[1] - w[0]) * (left / len));
+            }
+            break;
+        }
+    }
+    out
+}
+
+fn paint_badge(painter: &egui::Painter, center: egui::Pos2, badge: Badge) {
+    let ctx = painter.ctx().clone();
+    let id = egui::Id::new("peebify-badge");
+    let ring = Color32::from_rgb(14, 15, 24);
+    let icon = |x: f32, y: f32, scale: f32| center + egui::vec2(x - 12.0, y - 12.0) * (10.0 / 24.0) * scale;
+
+    let (fade, scale, stroke) = badge_pop(&ctx, id.with("ok"), badge == Badge::Done, 360);
+    if fade > 0.001 {
+        let mut p = painter.clone();
+        p.multiply_opacity(fade);
+        p.circle_filled(center, 10.0 * scale, ring);
+        p.circle_filled(center, 8.0 * scale, Color32::WHITE);
+        let check = [icon(20.0, 6.0, scale), icon(9.0, 17.0, scale), icon(4.0, 12.0, scale)];
+        let drawn = partial_path(&check, stroke);
+        if drawn.len() > 1 {
+            p.add(egui::Shape::line(drawn, egui::Stroke::new(1.6 * scale, INK)));
+        }
+    }
+
+    let (fade, scale, _) = badge_pop(&ctx, id.with("err"), badge == Badge::Failed, 200);
+    if fade > 0.001 {
+        let mut p = painter.clone();
+        p.multiply_opacity(fade);
+        p.circle_filled(center, 10.0 * scale, ring);
+        p.circle_filled(center, 8.0 * scale, DANGER);
+        let stroke = egui::Stroke::new(1.6 * scale, Color32::WHITE);
+        p.line_segment([icon(12.0, 5.5, scale), icon(12.0, 13.0, scale)], stroke);
+        p.circle_filled(icon(12.0, 18.5, scale), 0.95 * scale, Color32::WHITE);
+    }
+}
+
+fn paint_rail(ui: &egui::Ui, rail_rect: egui::Rect, rail: &Rail) {
+    let ctx = ui.ctx().clone();
+    let x = rail_rect.min.x + RAIL_PAD_X;
+    let y = rail_rect.min.y + RAIL_PAD_TOP;
+
+    let painter = ui.painter().clone();
+    if rail.error {
+        painter.circle_filled(egui::pos2(x + DOT / 2.0, y + STEP_ROW / 2.0), DOT / 2.0, DANGER);
+        paint_label(&painter, egui::pos2(x, y), "Error", DANGER);
+    } else if let Some(step) = rail.step {
+        paint_stepper(&painter, x, y, step, rail.progress);
     }
 
     const LOGO: f32 = 34.0;
@@ -585,62 +986,64 @@ fn paint_rail(ui: &mut egui::Ui, rail_rect: egui::Rect, rail: &Rail) {
     let block_h = LOGO + 11.0 + NAME_H + IDENT_H;
     let top = rail_rect.max.y - RAIL_PAD_BOTTOM - block_h;
 
+    let logo_rect = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(LOGO, LOGO));
     if let Some(logo) = rail.logo {
-        egui::Image::new(logo)
-            .corner_radius(CornerRadius::same(9))
-            .tint(Color32::WHITE.gamma_multiply(rail.logo_alpha))
-            .paint_at(
-                ui,
-                egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(LOGO, LOGO)),
-            );
+        let muted = motion::tween(
+            &ctx,
+            egui::Id::new("peebify-logo-muted"),
+            motion::flag(rail.muted),
+            Spec::new(700, Curve::Out),
+        );
+        let level = (255.0 * (1.0 - 0.15 * muted)).round() as u8;
+        let tint = Color32::from_gray(level);
+        let radius = CornerRadius::same(9);
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.add(
+            egui::epaint::RectShape::filled(logo_rect, radius, tint)
+                .with_texture(logo.id(), uv),
+        );
+        if muted > 0.001 {
+            if let Some(gray) = gray_logo(&ctx) {
+                painter.add(
+                    egui::epaint::RectShape::filled(logo_rect, radius, tint.gamma_multiply(0.8 * muted))
+                        .with_texture(gray.id(), uv),
+                );
+            }
+        }
     }
+    paint_badge(&painter, logo_rect.max - egui::vec2(3.0, 3.0), rail.badge);
 
-    let name = ui.fonts(|f| {
-        f.layout_no_wrap(
-            crate::consts::PRODUCT_NAME.to_owned(),
-            egui::FontId::new(15.5, egui::FontFamily::Name(SEMIBOLD.into())),
-            Color32::WHITE,
-        )
-    });
-    ui.painter()
-        .galley(egui::pos2(x, top + LOGO + 11.0), name, Color32::WHITE);
+    let name = painter.layout_no_wrap(
+        crate::consts::PRODUCT_NAME.to_owned(),
+        semibold_font(15.5),
+        Color32::WHITE,
+    );
+    painter.galley(egui::pos2(x, top + LOGO + 11.0), name, Color32::WHITE);
 
     let ident_color = tx(0.56);
-    let ident = ui.fonts(|f| {
-        f.layout_no_wrap(
-            rail.identity.clone(),
-            egui::FontId::new(text::SM, egui::FontFamily::Proportional),
-            ident_color,
-        )
-    });
-    ui.painter().galley(
-        egui::pos2(x, top + LOGO + 11.0 + NAME_H),
-        ident,
+    let ident = painter.layout_no_wrap(
+        rail.identity.clone(),
+        egui::FontId::new(text::SM, egui::FontFamily::Proportional),
         ident_color,
     );
+    painter.galley(egui::pos2(x, top + LOGO + 11.0 + NAME_H), ident, ident_color);
 }
 
 pub fn split(
-    ctx: &egui::Context,
-    surface: Surface,
-    scrim: Scrim,
+    root: &mut egui::Ui,
+    mood: Mood,
     closable: Close,
     rail: Rail,
     body: impl FnOnce(&mut egui::Ui),
 ) {
-    let focus = match surface {
-        Surface::Install => (0.32, 0.5),
-        Surface::Uninstall => (0.38, 0.5),
-    };
+    let ctx = &root.ctx().clone();
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
-        .show(ctx, |ui| {
+        .show(root, |ui| {
             let rect = ui.max_rect();
-            let uv = paint_backdrop(ui, rect, scrim, focus);
-
             let panel =
                 egui::Rect::from_min_max(egui::pos2(rect.min.x + RAIL_W, rect.min.y), rect.max);
-            frost(ui, rect, panel, uv, scrim);
+            paint_backdrop(ui, rect, panel, mood);
 
             let rail_rect =
                 egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + RAIL_W, rect.max.y));
@@ -667,59 +1070,12 @@ pub fn split(
             );
             body_ui.spacing_mut().item_spacing.y = 0.0;
             body(&mut body_ui);
+            hold_close(ctx, closable);
         });
 }
 
-pub fn compact(
-    ctx: &egui::Context,
-    surface: Surface,
-    closable: Close,
-    body: impl FnOnce(&mut egui::Ui),
-) {
-    let focus = match surface {
-        Surface::Install => (0.20, 0.40),
-        Surface::Uninstall => (0.30, 0.45),
-    };
-    egui::CentralPanel::default()
-        .frame(egui::Frame::NONE)
-        .show(ctx, |ui| {
-            let rect = ui.max_rect();
-            let ctx_ref = ui.ctx().clone();
-            ui.painter().rect_filled(rect, CornerRadius::ZERO, BG);
-            if let Some(tex) = wallpaper(&ctx_ref, true) {
-                let uv = cover_uv(tex.size_vec2(), rect, focus);
-                egui::Image::new(&tex).uv(uv).paint_at(ui, rect);
-            }
-            horizontal_gradient(
-                ui.painter(),
-                rect,
-                &[
-                    (0.0, scrim_color(SCRIM_SPLASH.top)),
-                    (1.0, scrim_color(SCRIM_SPLASH.bottom)),
-                ],
-            );
-
-            drag_strip(
-                ui,
-                ctx,
-                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 42.0)),
-                "titlebar-drag",
-            );
-            minimize_button(ui, ctx, rect);
-            close_button(ui, ctx, rect, closable == Close::Enabled);
-
-            let inner = egui::Rect::from_min_max(
-                rect.min + egui::vec2(SPLASH_PAD_X, SPLASH_PAD_TOP),
-                rect.max - egui::vec2(SPLASH_PAD_X, SPLASH_PAD_BOTTOM),
-            );
-            let mut body_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(inner)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            body_ui.spacing_mut().item_spacing.y = 0.0;
-            body(&mut body_ui);
-        });
+pub fn group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(add).inner
 }
 
 // ------------ Shared Widgets ------------
@@ -744,14 +1100,7 @@ pub fn action_row(ui: &mut egui::Ui, right_aligned: bool, add: impl FnOnce(&mut 
     ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 38.0), layout, add);
 }
 
-fn paragraph_label(
-    ui: &mut egui::Ui,
-    body: &str,
-    size: f32,
-    color: Color32,
-    max_width: f32,
-    selectable: bool,
-) {
+pub fn paragraph(ui: &mut egui::Ui, body: &str, size: f32, color: Color32, max_width: f32) {
     let width = max_width.min(ui.available_width());
     ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
         ui.add(
@@ -761,31 +1110,17 @@ fn paragraph_label(
                     .color(color)
                     .line_height(Some(size * 1.55)),
             )
-            .wrap()
-            .selectable(selectable),
+            .wrap(),
         );
     });
-}
-
-pub fn paragraph(ui: &mut egui::Ui, body: &str, size: f32, color: Color32, max_width: f32) {
-    paragraph_label(ui, body, size, color, max_width, false);
-}
-
-pub fn selectable_paragraph(
-    ui: &mut egui::Ui,
-    body: &str,
-    size: f32,
-    color: Color32,
-    max_width: f32,
-) {
-    paragraph_label(ui, body, size, color, max_width, true);
 }
 
 pub fn meta_label(ui: &mut egui::Ui, label: &str) {
     ui.label(
         RichText::new(label.to_uppercase())
             .size(text::MICRO)
-            .color(tx(0.55)),
+            .color(tx(0.55))
+            .extra_letter_spacing(text::MICRO * 0.04),
     );
 }
 
@@ -846,7 +1181,7 @@ impl Tone {
     }
 }
 
-pub fn card(ui: &mut egui::Ui, tone: Tone, pad: i8, body: impl FnOnce(&mut egui::Ui)) {
+pub fn card<R>(ui: &mut egui::Ui, tone: Tone, pad: i8, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let (stroke, fill) = tone.colors();
     egui::Frame::new()
         .fill(fill)
@@ -855,24 +1190,30 @@ pub fn card(ui: &mut egui::Ui, tone: Tone, pad: i8, body: impl FnOnce(&mut egui:
         .inner_margin(egui::Margin::same(pad))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            body(ui);
-        });
+            body(ui)
+        })
+        .inner
 }
 
-pub fn detail_box(ui: &mut egui::Ui, tone: Tone, label: &str, body: &str) {
+pub fn detail_box(ui: &mut egui::Ui, tone: Tone, label: &str, body: &str, max_height: f32) {
     card(ui, tone, 12, |card| {
         meta_label(card, label);
         card.add_space(5.0);
-        card.add(
-            egui::Label::new(
-                RichText::new(body)
-                    .size(text::SM)
-                    .color(tx(0.82))
-                    .line_height(Some(text::SM * 1.55)),
-            )
-            .wrap()
-            .selectable(true),
-        );
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .auto_shrink([false, true])
+            .show(card, |text| {
+                text.add(
+                    egui::Label::new(
+                        RichText::new(body)
+                            .size(text::SM)
+                            .color(tx(0.82))
+                            .line_height(Some(text::SM * 1.55)),
+                    )
+                    .wrap()
+                    .selectable(true),
+                );
+            });
     });
 }
 
@@ -900,7 +1241,7 @@ pub fn text_field(ui: &mut egui::Ui, value: &mut String, size: egui::Vec2) -> eg
         inner.size(),
         egui::TextEdit::singleline(value)
             .id(id)
-            .frame(false)
+            .frame(egui::Frame::NONE)
             .text_color(tx(0.85))
             .font(egui::FontId::new(text::MD, egui::FontFamily::Proportional))
             .vertical_align(egui::Align::Center)
@@ -913,8 +1254,7 @@ pub fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Res
     const GAP: f32 = 11.0;
     const RADIUS: u8 = 4;
     let font = egui::FontId::new(text::BASE, egui::FontFamily::Proportional);
-    let color = tx(0.90);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, color));
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER));
     let size = egui::vec2(BOX + GAP + galley.size().x, BOX.max(galley.size().y));
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.clicked() {
@@ -924,51 +1264,53 @@ pub fn checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Res
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, *checked, label)
     });
-    let hover = ui
-        .ctx()
-        .animate_bool_with_time(response.id, response.hovered(), 0.12);
-    let draw = ui
-        .ctx()
-        .animate_bool_with_time(response.id.with("check"), *checked, 0.12);
+    let ctx = ui.ctx().clone();
+    let on = motion::flag(*checked);
+    let hover = ctx.animate_bool_with_time(response.id, response.hovered(), 0.15);
+    let fill = motion::tween(&ctx, response.id.with("fill"), on, Spec::new(160, Curve::Ease));
+    let pop = motion::tween(&ctx, response.id.with("pop"), on, Spec::new(380, Curve::Spring));
+    let draw = motion::tween(
+        &ctx,
+        response.id.with("draw"),
+        on,
+        if *checked {
+            Spec::new(280, Curve::InOut).after(80)
+        } else {
+            Spec::new(120, Curve::Ease)
+        },
+    );
 
+    let scale = if *checked && !motion::reduced() {
+        0.9 + 0.1 * pop
+    } else {
+        1.0
+    };
     let box_rect = egui::Rect::from_center_size(
         egui::pos2(rect.min.x + BOX / 2.0, rect.center().y),
-        egui::vec2(BOX, BOX),
+        egui::vec2(BOX, BOX) * scale,
     );
     let painter = ui.painter();
-    if *checked {
-        painter.rect_filled(box_rect, CornerRadius::same(RADIUS), Color32::WHITE);
-        let c = box_rect.center();
-        let p1 = egui::pos2(c.x - 4.0, c.y + 0.3);
-        let p2 = egui::pos2(c.x - 1.4, c.y + 2.9);
-        let p3 = egui::pos2(c.x + 4.1, c.y - 3.1);
-        let mut points = vec![p1];
-        if draw < 0.5 {
-            points.push(p1 + (p2 - p1) * (draw * 2.0));
-        } else {
-            points.push(p2);
-            points.push(p2 + (p3 - p2) * ((draw - 0.5) * 2.0));
+    let idle_border = tx(0.32 + 0.23 * hover);
+    let fill_color = lerp_color(Color32::from_white_alpha((14.0 * hover) as u8), Color32::WHITE, fill);
+    painter.rect_filled(box_rect, CornerRadius::same(RADIUS), fill_color);
+    painter.rect_stroke(
+        box_rect,
+        CornerRadius::same(RADIUS),
+        egui::Stroke::new(1.0, lerp_color(idle_border, Color32::WHITE, fill)),
+        egui::StrokeKind::Inside,
+    );
+    if draw > 0.001 {
+        let origin = box_rect.center() - egui::vec2(5.5, 4.5) * scale;
+        let at = |x: f32, y: f32| origin + egui::vec2(x, y) * scale;
+        let points = partial_path(&[at(1.5, 4.6), at(4.5, 7.5), at(9.5, 1.5)], draw);
+        if points.len() > 1 {
+            painter.add(egui::Shape::line(points, egui::Stroke::new(2.0 * scale, INK)));
         }
-        painter.add(egui::Shape::line(
-            points,
-            egui::Stroke::new(2.0, Color32::from_rgb(0x12, 0x13, 0x1e)),
-        ));
-    } else {
-        painter.rect_filled(
-            box_rect,
-            CornerRadius::same(RADIUS),
-            Color32::from_white_alpha((18.0 * hover) as u8),
-        );
-        painter.rect_stroke(
-            box_rect,
-            CornerRadius::same(RADIUS),
-            egui::Stroke::new(1.0, tx(0.32 + 0.28 * hover)),
-            egui::StrokeKind::Inside,
-        );
     }
+    let color = lerp_color(tx(0.90), Color32::WHITE, hover);
     painter.galley(
         egui::pos2(
-            box_rect.max.x + GAP,
+            rect.min.x + BOX + GAP,
             rect.center().y - galley.size().y / 2.0,
         ),
         galley,
@@ -999,54 +1341,54 @@ pub fn sub_note(ui: &mut egui::Ui, body: &str) {
     });
 }
 
-fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgba_premultiplied(
-        l(a.r(), b.r()),
-        l(a.g(), b.g()),
-        l(a.b(), b.b()),
-        l(a.a(), b.a()),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pill_button(
-    ui: &mut egui::Ui,
-    label: &str,
-    text_color: Color32,
+struct Pill {
+    text: Color32,
+    text_hover: Color32,
     fill: Color32,
     fill_hover: Color32,
-    stroke_color: Color32,
+    stroke: Color32,
     stroke_hover: Color32,
-    h_pad: f32,
+    pad: f32,
     height: f32,
-) -> egui::Response {
-    let font = egui::FontId::new(text::BODY, egui::FontFamily::Name(SEMIBOLD.into()));
+    min_width: f32,
+}
+
+fn pill_button(ui: &mut egui::Ui, label: &str, pill: Pill) -> egui::Response {
+    let font = semibold_font(text::BODY);
     let enabled = ui.is_enabled();
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, text_color));
-    let size = egui::vec2(galley.size().x + h_pad * 2.0, height);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, Color32::PLACEHOLDER));
+    let size = egui::vec2(
+        (galley.size().x + pill.pad * 2.0).max(pill.min_width),
+        pill.height,
+    );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
 
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
 
     let t = ui
         .ctx()
-        .animate_bool_with_time(response.id, enabled && response.hovered(), 0.12);
-    let pressed = response.is_pointer_button_down_on();
-    let rect = rect.translate(egui::vec2(0.0, if pressed { 1.0 } else { 0.0 }));
+        .animate_bool_with_time(response.id, enabled && response.hovered(), 0.15);
+    let pressed = ui.ctx().animate_bool_with_time(
+        response.id.with("press"),
+        enabled && response.is_pointer_button_down_on(),
+        0.12,
+    );
+    let rect = if motion::reduced() {
+        rect
+    } else {
+        egui::Rect::from_center_size(rect.center(), rect.size() * (1.0 - 0.03 * pressed))
+    };
 
-    let fill = lerp_color(fill, fill_hover, t);
-    let stroke = lerp_color(stroke_color, stroke_hover, t);
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(8), fill);
+    painter.rect_filled(rect, CornerRadius::same(8), lerp_color(pill.fill, pill.fill_hover, t));
     painter.rect_stroke(
         rect,
         CornerRadius::same(8),
-        egui::Stroke::new(1.0, stroke),
+        egui::Stroke::new(1.0, lerp_color(pill.stroke, pill.stroke_hover, t)),
         egui::StrokeKind::Inside,
     );
     let text_pos = rect.center() - galley.size() / 2.0;
-    painter.galley(text_pos, galley, text_color);
+    painter.galley(text_pos, galley, lerp_color(pill.text, pill.text_hover, t));
     focus_ring(painter, rect, 8, response.has_focus());
 
     if enabled {
@@ -1069,6 +1411,20 @@ fn focus_ring(painter: &egui::Painter, rect: egui::Rect, radius: u8, focused: bo
     );
 }
 
+fn secondary_pill(pad: f32, height: f32, min_width: f32) -> Pill {
+    Pill {
+        text: tx(0.78),
+        text_hover: Color32::WHITE,
+        fill: Color32::TRANSPARENT,
+        fill_hover: tx(0.06),
+        stroke: tx(0.20),
+        stroke_hover: tx(0.34),
+        pad,
+        height,
+        min_width,
+    }
+}
+
 pub fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     if !ui.is_enabled() {
         return secondary_button(ui, label);
@@ -1076,62 +1432,54 @@ pub fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     pill_button(
         ui,
         label,
-        Color32::from_rgb(0x12, 0x13, 0x1e),
-        Color32::WHITE,
-        tx(0.88),
-        Color32::WHITE,
-        Color32::WHITE,
-        20.0,
-        38.0,
+        Pill {
+            text: INK,
+            text_hover: INK,
+            fill: Color32::WHITE,
+            fill_hover: tx(0.88),
+            stroke: Color32::WHITE,
+            stroke_hover: Color32::WHITE,
+            pad: 20.0,
+            height: 38.0,
+            min_width: 0.0,
+        },
     )
 }
 
 pub fn secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    pill_button(
-        ui,
-        label,
-        tx(0.78),
-        Color32::TRANSPARENT,
-        Color32::from_white_alpha(14),
-        tx(0.20),
-        tx(0.42),
-        20.0,
-        38.0,
-    )
+    pill_button(ui, label, secondary_pill(20.0, 38.0, 0.0))
+}
+
+pub fn wide_secondary_button(ui: &mut egui::Ui, label: &str, min_width: f32) -> egui::Response {
+    pill_button(ui, label, secondary_pill(20.0, 38.0, min_width))
 }
 
 pub fn small_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    pill_button(
-        ui,
-        label,
-        tx(0.78),
-        Color32::TRANSPARENT,
-        Color32::from_white_alpha(14),
-        tx(0.20),
-        tx(0.42),
-        15.0,
-        36.0,
-    )
+    pill_button(ui, label, secondary_pill(15.0, 36.0, 0.0))
 }
 
 pub fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     pill_button(
         ui,
         label,
-        DANGER_TEXT,
-        DANGER.gamma_multiply(0.09),
-        DANGER.gamma_multiply(0.22),
-        DANGER.gamma_multiply(0.70),
-        DANGER,
-        24.0,
-        38.0,
+        Pill {
+            text: DANGER_TEXT,
+            text_hover: DANGER_TEXT,
+            fill: DANGER.gamma_multiply(0.09),
+            fill_hover: DANGER.gamma_multiply(0.18),
+            stroke: DANGER.gamma_multiply(0.70),
+            stroke_hover: DANGER.gamma_multiply(0.95),
+            pad: 24.0,
+            height: 38.0,
+            min_width: 0.0,
+        },
     )
 }
 
 pub fn link(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
     let color = tx(0.60);
-    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, color));
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(label.to_owned(), font, color));
     let (rect, response) =
         ui.allocate_exact_size(galley.size() + egui::vec2(0.0, 4.0), egui::Sense::click());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, true, label));
@@ -1153,7 +1501,9 @@ pub fn link(ui: &mut egui::Ui, label: &str) -> egui::Response {
     response
 }
 
-pub fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
+pub const BAR_STEADY: Spec = Spec::new(160, Curve::Linear);
+
+pub fn progress_bar(ui: &mut egui::Ui, id: egui::Id, fraction: f32, spec: Spec) {
     const HEIGHT: f32 = 6.0;
     const RADIUS: u8 = 3;
     let (rect, _) = ui.allocate_exact_size(
@@ -1180,20 +1530,48 @@ pub fn progress_bar(ui: &mut egui::Ui, fraction: f32) {
         return;
     }
 
-    let eased =
-        ui.ctx()
-            .animate_value_with_time(ui.id().with("progress"), fraction.clamp(0.0, 1.0), 0.35);
-    if eased > 0.0 {
-        let mut fill = rect;
-        fill.set_width((rect.width() * eased).max(HEIGHT));
-        ui.painter()
-            .rect_filled(fill, CornerRadius::same(RADIUS), Color32::WHITE);
+    let eased = motion::tween(ui.ctx(), id, fraction.clamp(0.0, 1.0), spec);
+    let mut fill = rect;
+    fill.set_width((rect.width() * eased).max(rect.width() * 0.015).max(HEIGHT));
+    ui.painter()
+        .rect_filled(fill, CornerRadius::same(RADIUS), Color32::WHITE);
+
+    if motion::reduced() {
+        return;
     }
+    let band = fill.width() * 0.35;
+    let t = (ui.input(|i| i.time) % 1.6) as f32 / 1.6;
+    let x = fill.min.x + band * (-1.0 + 3.86 * Curve::Sine.at(t));
+    let sheen = egui::Rect::from_min_size(egui::pos2(x, fill.min.y), egui::vec2(band, HEIGHT));
+    let shade = |a: f32| Color32::from_rgba_unmultiplied(INK.r(), INK.g(), INK.b(), (a * 255.0) as u8);
+    horizontal_gradient(
+        &ui.painter().with_clip_rect(fill.shrink2(egui::vec2(1.0, 0.0))),
+        sheen,
+        &[(0.0, shade(0.0)), (0.5, shade(0.22)), (1.0, shade(0.0))],
+    );
+    ui.ctx().request_repaint();
 }
 
 // ------------ Progress Pacing And Engine Thread ------------
-// Pacer holds each progress phase on screen for a moment so fast ones do not flicker past. spawn_engine runs the
-// install or uninstall work on a thread, and friendly_error turns raw OS errors into plain advice.
+// step_label folds the engine's phases into the few steps the progress screen names. Pacer holds each phase on screen
+// for a moment so fast ones do not flicker past. spawn_engine runs the install or uninstall work on a thread, and
+// friendly_error turns raw OS errors into plain advice.
+pub fn step_label(phase: &str) -> Option<&str> {
+    Some(match phase {
+        "Verifying installer…" => return None,
+        "Closing Peebify Launcher…" => "Closing the launcher…",
+        "Copying files…" | "Writing uninstaller…" | "Installing files…" => "Copying files…",
+        "Registering with Windows…" | "Creating shortcuts…" => "Creating shortcuts…",
+        "Checking WebView2 runtime…" | "Checking Visual C++ runtime…" | "Finishing up…" => {
+            "Finishing up…"
+        }
+        "Removing files…" | "Removing shortcuts and registry entries…" => "Removing files…",
+        "Removing installed games…" => "Removing game files…",
+        "Removing settings and data…" => "Removing settings & mods…",
+        other => other,
+    })
+}
+
 pub struct Pacer {
     phase: String,
     percent: f32,
@@ -1218,25 +1596,37 @@ impl Pacer {
     pub fn push(&mut self, phase: String, percent: f32) {
         let current = self.queue.back().map(|(p, _)| p).unwrap_or(&self.phase);
         if current == &phase {
-            match self.queue.back_mut() {
-                Some(last) => last.1 = percent,
-                None => self.percent = percent,
-            }
+            self.advance(percent);
             return;
         }
         self.queue.push_back((phase, percent));
     }
 
+    pub fn advance(&mut self, percent: f32) {
+        match self.queue.back_mut() {
+            Some(last) => last.1 = percent,
+            None => self.percent = percent,
+        }
+    }
+
+    pub fn report(&mut self, phase: &str, percent: f32) {
+        match step_label(phase) {
+            Some(label) => self.push(label.to_string(), percent),
+            None => self.advance(percent),
+        }
+    }
+
     pub fn finish(&mut self) {
+        self.finish_as("Finishing up…");
+    }
+
+    pub fn finish_as(&mut self, closing: &str) {
         self.finished = true;
         let last = self.queue.back().map(|(_, p)| *p).unwrap_or(self.percent);
         if last < 100.0 {
-            self.push("Finishing up…".to_string(), 100.0);
+            self.push(closing.to_string(), 100.0);
         }
-        match self.queue.back_mut() {
-            Some(last) => last.1 = 100.0,
-            None => self.percent = 100.0,
-        }
+        self.advance(100.0);
     }
 
     pub fn tick(&mut self) {
@@ -1261,6 +1651,21 @@ impl Pacer {
     pub fn settled(&self) -> bool {
         self.finished && self.queue.is_empty() && self.shown_at.elapsed() >= PHASE_DWELL
     }
+}
+
+pub fn progress_readout(ui: &mut egui::Ui, label: &str, percent: f32, label_size: f32, pct_size: f32) {
+    ui.horizontal(|row| {
+        row.label(RichText::new(label).size(label_size).color(tx(0.85)));
+        if percent >= 0.0 {
+            row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
+                row.label(
+                    RichText::new(format!("{}%", percent.round() as i32))
+                        .size(pct_size)
+                        .color(tx(0.55)),
+                );
+            });
+        }
+    });
 }
 
 pub fn spawn_engine(
@@ -1321,9 +1726,82 @@ pub fn log_dir() -> Option<std::path::PathBuf> {
     crate::consts::user_data_dir().map(|d| d.join("logs"))
 }
 
+#[derive(Default)]
+pub struct Copied {
+    at: Option<std::time::Instant>,
+}
+
+impl Copied {
+    pub fn mark(&mut self) {
+        self.at = Some(std::time::Instant::now());
+    }
+
+    pub fn label(&self, ctx: &egui::Context) -> &'static str {
+        const SHOWN: std::time::Duration = std::time::Duration::from_millis(1400);
+        match self.at {
+            Some(at) if at.elapsed() < SHOWN => {
+                ctx.request_repaint_after(SHOWN - at.elapsed());
+                "Copied"
+            }
+            _ => "Copy details",
+        }
+    }
+}
+
+pub struct FailureActions {
+    pub copy: bool,
+    pub open_log: bool,
+    pub close: bool,
+    pub retry: bool,
+}
+
+pub fn failure_footer(ui: &mut egui::Ui, copy_label: &str, retry: bool) -> FailureActions {
+    let mut actions = FailureActions {
+        copy: false,
+        open_log: false,
+        close: false,
+        retry: false,
+    };
+    action_row_split(
+        ui,
+        |left| {
+            actions.copy = wide_secondary_button(left, copy_label, 116.0).clicked();
+            left.add_space(14.0);
+            actions.open_log = link(left, "Open log").clicked();
+        },
+        |right| {
+            if retry {
+                actions.retry = primary_button(right, "Retry").clicked();
+                right.add_space(10.0);
+                actions.close = secondary_button(right, "Close").clicked();
+            } else {
+                actions.close = primary_button(right, "Close").clicked();
+            }
+        },
+    );
+    actions
+}
+
+pub fn action_row_split(
+    ui: &mut egui::Ui,
+    left: impl FnOnce(&mut egui::Ui),
+    right: impl FnOnce(&mut egui::Ui),
+) {
+    action_row(ui, false, |row| {
+        left(row);
+        row.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+    });
+}
+
+pub fn open_log_folder() {
+    if let Some(dir) = log_dir() {
+        crate::win::open_folder(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{friendly_error, Pacer};
+    use super::{friendly_error, step_label, Pacer};
 
     #[test]
     fn access_denied_never_suggests_administrator() {
@@ -1363,5 +1841,32 @@ mod tests {
             pacer.queue.back().map(|(p, pct)| (p.as_str(), *pct)),
             Some(("Finishing up…", 100.0))
         );
+    }
+
+    #[test]
+    fn engine_phases_collapse_into_the_four_install_steps() {
+        let mut pacer = Pacer::new("Copying files…");
+        for (phase, pct) in [
+            ("Verifying installer…", 2.0),
+            ("Copying files…", 30.0),
+            ("Writing uninstaller…", 68.0),
+            ("Installing files…", 72.0),
+            ("Registering with Windows…", 78.0),
+            ("Creating shortcuts…", 82.0),
+            ("Checking WebView2 runtime…", 86.0),
+            ("Finishing up…", 98.0),
+        ] {
+            pacer.report(phase, pct);
+        }
+        let labels: Vec<&str> = pacer.queue.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(labels, ["Creating shortcuts…", "Finishing up…"]);
+        assert_eq!(pacer.percent(), 72.0);
+    }
+
+    #[test]
+    fn unknown_phases_pass_through_and_verification_is_silent() {
+        assert_eq!(step_label("Downloading WebView2…"), Some("Downloading WebView2…"));
+        assert_eq!(step_label("Verifying installer…"), None);
+        assert_eq!(step_label("Removing installed games…"), Some("Removing game files…"));
     }
 }

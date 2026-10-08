@@ -134,6 +134,43 @@ export const GAMES: Game[] = [
     betaNote:
       "Neowiz ships Brown Dust II as one client package, so Peebify installs and updates it in a single download. Peebify checksums every file it unpacks, but repairing even one of them means fetching that whole package again.",
   },
+  {
+    id: "arknights",
+    short: "AK",
+    name: "Arknights",
+    icon: "/icons/arknights.webp",
+    wallpaperStatic: "/icons/wallpaper_arknights_noneanimated.webp",
+    wallpaperFallback:
+      "radial-gradient(120% 95% at 80% 10%, rgba(59,130,246,.36), transparent 55%), linear-gradient(160deg,#111827 0%,#0a0b0e 70%)",
+    graphicsApiChoice: true,
+  },
+  {
+    id: "bluearchive",
+    short: "BA",
+    name: "Blue Archive",
+    icon: "/icons/bluearchive.webp",
+    wallpaperStatic: "/icons/wallpaper_bluearchive_noneanimated.webp",
+    wallpaperFallback:
+      "radial-gradient(120% 95% at 80% 10%, rgba(56,189,248,.36), transparent 55%), linear-gradient(160deg,#10243a 0%,#080d14 70%)",
+    installHelpUrl: "https://store.steampowered.com/app/3557620/Blue_Archive/",
+    managed: false,
+    betaNote:
+      "Blue Archive is only distributed on PC through Steam. Install it there first, then point Peebify at the folder. Peebify launches it through Steam, so the overlay and playtime tracking keep working.",
+  },
+  {
+    id: "dna",
+    short: "DNA",
+    name: "Duet Night Abyss",
+    icon: "/icons/dna.webp",
+    wallpaperStatic: "/icons/wallpaper_dna_noneanimated.webp",
+    wallpaperFallback:
+      "radial-gradient(120% 95% at 80% 10%, rgba(201,169,110,.34), transparent 55%), linear-gradient(160deg,#141a2e 0%,#090a12 70%)",
+    graphicsApiChoice: true,
+    graphicsApiDefault: "dx12",
+    supportsQuickRepair: false,
+    betaNote:
+      "Pan Studio ships Duet Night Abyss as one archive, so Peebify installs and updates it in a single download and unpacks it with HDiffPatch. Peebify checks every file against Pan Studio's checksums, but repairing even one of them means fetching that whole archive again.",
+  },
 ];
 
 export const gameById = (id: GameId): Game =>

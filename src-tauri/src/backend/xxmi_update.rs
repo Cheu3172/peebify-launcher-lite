@@ -292,14 +292,18 @@ pub fn public_key_for(package: &str) -> Option<&'static str> {
 }
 
 pub fn verify_signature(package: &str, bytes: &[u8], signature: &str) -> Result<(), String> {
+    let key_text = public_key_for(package)
+        .ok_or_else(|| format!("Peebify has no publisher key for the {package} package."))?;
+    verify_with_key(package, key_text, bytes, signature)
+}
+
+fn verify_with_key(package: &str, key_text: &str, bytes: &[u8], signature: &str) -> Result<(), String> {
     use base64::Engine;
     use p384::ecdsa::signature::hazmat::PrehashVerifier;
     use p384::ecdsa::{Signature, VerifyingKey};
     use p384::pkcs8::DecodePublicKey;
     use sha2::{Digest, Sha256};
 
-    let key_text = public_key_for(package)
-        .ok_or_else(|| format!("Peebify has no publisher key for the {package} package."))?;
     let key_der = base64::engine::general_purpose::STANDARD
         .decode(key_text)
         .map_err(|e| format!("The {package} publisher key is malformed: {e}"))?;
@@ -323,7 +327,15 @@ pub fn file_sha256(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 
@@ -882,5 +894,15 @@ mod tests {
             verify_signature(package, &bytes, release.signature.as_deref().unwrap()).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Produced by p384 0.13 from a fixed scalar. Pinned so a crate upgrade that changed key or
+    // signature parsing would fail here instead of refusing every real XXMI release.
+    #[test]
+    fn a_pinned_publisher_signature_still_verifies() {
+        let key = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEcszeM3U3YiReAV2pLkj6AoSVUi3EI1bH499R3PVqXhnedCrNOhn3mvNy3JcF9WDYV7kFEaBAasE3vmG2lZnOTIbBxTEK7cxP8LBKvJOuXGPRXkoBV89q57pfrIXn3mZi";
+        let sig = "MGYCMQDDJeBNaUthhNxgQeHTZNF4sG7Su4LXw0kifkTE8koTy6FVoxfhqaoM/6hBb3w8WKkCMQCnUcUcckgCdy2g8pz2+l4e/7TxTgleQHEVReI660bVqm80AnqFfR5WXQwikLYG03Y=";
+        assert!(verify_with_key("xxmi", key, b"peebify-xxmi-kat", sig).is_ok());
+        assert!(verify_with_key("xxmi", key, b"peebify-xxmi-kaT", sig).is_err());
     }
 }

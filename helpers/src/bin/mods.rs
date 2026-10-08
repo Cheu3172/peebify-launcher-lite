@@ -13,8 +13,9 @@ mod host {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, BOOL, ERROR_BAD_LENGTH, ERROR_PARTIAL_COPY, HANDLE, HWND,
+        CloseHandle, GetLastError, ERROR_BAD_LENGTH, ERROR_PARTIAL_COPY, HANDLE, HWND,
         INVALID_HANDLE_VALUE, LPARAM, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{

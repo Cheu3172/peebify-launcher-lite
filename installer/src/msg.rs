@@ -60,7 +60,6 @@ impl Cancel {
 }
 
 pub type EventSink = std::sync::mpsc::Sender<EngineEvent>;
-pub type EngineWork = Box<dyn FnOnce(&EventSink) -> Result<(), EngineError> + Send>;
 
 static LAST_LOGGED: Mutex<Option<(String, i32)>> = Mutex::new(None);
 

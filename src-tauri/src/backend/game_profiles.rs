@@ -5,8 +5,9 @@ use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
-pub const GAME_IDS: [&str; 12] = [
+pub const GAME_IDS: [&str; 15] = [
     "wuwa", "zzz", "hsr", "nte", "endfield", "genshin", "hi3", "pgr", "gf2", "gf1", "re1999", "bd2",
+    "arknights", "bluearchive", "dna",
 ];
 pub const DEFAULT_GAME_ID: &str = "wuwa";
 pub const VOICE_LANGUAGES: [&str; 4] = ["en-us", "ja-jp", "ko-kr", "zh-cn"];
@@ -786,6 +787,146 @@ fn profiles() -> &'static Value {
                     "discord": "https://discord.com/invite/qMbpbvWwja",
                     "youtube": "https://www.youtube.com/channel/UCmnj4VhKgycXSq3-GrQhhgQ"
                 }
+            },
+
+            "arknights": {
+                "id": "arknights",
+                "wallpaperSlug": "arknights",
+                "displayName": "Arknights",
+                "shortName": "Arknights",
+                "apiClientKey": "arknights",
+
+                "supportsManagedInstall": true,
+                "installMode": "yostar",
+                "showLuniteSocial": false,
+
+                "ysApiUrl": "https://api-launcher-en.yo-star.com",
+                "ysGameTag": "Arknights_EN",
+                "ysLauncherVersion": "1.8.1",
+                "ysSignKey": "DE7108E9B2842FD460F4777702727869",
+                "ysNewsUrl": "https://www.arknights.global/news",
+                "ysNewsApi": "https://www.arknights.global/api/resource/news",
+
+                "executableName": "Arknights.exe",
+                "clientProcessName": "Arknights.exe",
+                "exitCompanions": ["UnityCrashHandler64.exe"],
+
+                "graphicsApiArgs": { "dx11": ["-force-d3d11"], "dx12": ["-force-d3d12"] },
+                "graphicsApiDefault": "dx11",
+
+                "communityTools": {
+                    "official": [
+                        {
+                            "name": "Arknights Official",
+                            "url": "https://www.arknights.global/"
+                        },
+                        {
+                            "name": "Arknights News",
+                            "url": "https://www.arknights.global/news"
+                        }
+                    ],
+                    "community": [
+                        { "name": "Arknights Terra Wiki", "url": "https://arknights.wiki.gg/" },
+                        { "name": "Penguin Statistics", "url": "https://penguin-stats.io/" }
+                    ]
+                },
+
+                "socialUrls": {
+                    "discord": "https://discord.com/invite/arknights",
+                    "youtube": "https://www.youtube.com/channel/UCR0J2NYGuC8epsa1O4DMmXQ",
+                    "x": "https://x.com/ArknightsEN"
+                }
+            },
+            "bluearchive": {
+                "id": "bluearchive",
+                "wallpaperSlug": "blue-archive",
+                "displayName": "Blue Archive",
+                "shortName": "Blue Archive",
+                "apiClientKey": "bluearchive",
+                "supportsManagedInstall": false,
+                "newsSource": "nexon",
+                "showLuniteSocial": false,
+
+                "nexonForumUrl": "https://forum.nexon.com",
+                "nexonForumAlias": "bluearchive-en",
+                "nexonCountryCode": "US",
+                "nexonNoticeBoards": ["3028", "3219"],
+                "nexonNewsBoards": ["3217", "3218"],
+
+                "executableName": "BlueArchive.exe",
+                "clientProcessName": "BlueArchive.exe",
+
+                "steamAppId": "3557620",
+
+                "communityTools": {
+                    "official": [
+                        {
+                            "name": "Blue Archive Official",
+                            "url": "https://bluearchive.nexon.com/home"
+                        },
+                        {
+                            "name": "Blue Archive News",
+                            "url": "https://forum.nexon.com/bluearchive-en/board_list?board=3028"
+                        }
+                    ],
+                    "community": [
+                        { "name": "SchaleDB", "url": "https://schaledb.com/" },
+                        { "name": "Blue Archive Wiki", "url": "https://bluearchive.wiki/" }
+                    ]
+                },
+
+                "socialUrls": {
+                    "discord": "https://discord.gg/bluearchiveglobal",
+                    "x": "https://x.com/en_BlueArchive"
+                }
+            },
+            "dna": {
+                "id": "dna",
+                "wallpaperSlug": "duet-night-abyss",
+                "displayName": "Duet Night Abyss",
+                "shortName": "Duet Night Abyss",
+                "apiClientKey": "dna",
+
+                "supportsManagedInstall": true,
+                "installMode": "dna",
+                "showLuniteSocial": false,
+
+                "dnaCdns": [
+                    "https://pan01-cdn-ali-jp.dna-panstudio.com",
+                    "https://pan01-cdn-eo-jp.dna-panstudio.com",
+                    "https://pan01-cdn-aws-jp.dna-panstudio.com",
+                    "https://pan01-cdn-hs-jp.dna-panstudio.com"
+                ],
+                "dnaPackagePath": "Packages/Global/WindowsNoEditor/PC_OBT_Global_Pub",
+                "dnaSiteUrl": "https://duetnightabyss.dna-panstudio.com",
+                "dnaNewsCategory": "860",
+                "dnaNewsLanguage": "EN",
+
+                "executableName": "EM.exe",
+                "clientProcessName": "EM-Win64-Shipping.exe",
+
+                "graphicsApiArgs": { "dx11": ["-dx11"], "dx12": [] },
+                "graphicsApiDefault": "dx12",
+
+                "communityTools": {
+                    "official": [
+                        {
+                            "name": "Duet Night Abyss Official",
+                            "url": "https://duetnightabyss.dna-panstudio.com/#/home"
+                        },
+                        {
+                            "name": "Duet Night Abyss News",
+                            "url": "https://duetnightabyss.dna-panstudio.com/#/news"
+                        }
+                    ],
+                    "community": []
+                },
+
+                "socialUrls": {
+                    "discord": "https://discord.com/invite/CuYCcPhKfA",
+                    "youtube": "https://www.youtube.com/@DuetNightAbyss_Official",
+                    "x": "https://x.com/DNAbyss_EN"
+                }
             }
         })
     })
@@ -845,6 +986,8 @@ pub enum InstallMode {
     Gf2,
     Bluepoch,
     Bd2,
+    Dna,
+    Yostar,
     Unknown,
 }
 
@@ -858,6 +1001,8 @@ impl InstallMode {
             Some("gf2") => Self::Gf2,
             Some("bluepoch") => Self::Bluepoch,
             Some("bd2") => Self::Bd2,
+            Some("dna") => Self::Dna,
+            Some("yostar") => Self::Yostar,
             Some(_) => Self::Unknown,
         }
     }

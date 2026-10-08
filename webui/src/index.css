@@ -127,6 +127,26 @@ body {
   user-select: none;
 }
 
+/* Interface size animation (lib/scaleTransition.ts): the layout is held at its size from before the change as a card
+   in the window's top-left corner, and scaled with a transform, so nothing re-wraps or shifts mid-animation. No
+   will-change on purpose: it would make the browser stretch a bitmap and blur the text. */
+html.ui-scale-pinned body {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: var(--ui-scale-pin-w);
+  height: var(--ui-scale-pin-h);
+  transform-origin: 0 0;
+}
+
+html.ui-scale-pinned .h-screen {
+  height: var(--ui-scale-pin-h);
+}
+
+html.ui-scale-pinned .w-screen {
+  width: var(--ui-scale-pin-w);
+}
+
 h1,
 h2 {
   font-family: var(--font-display);
@@ -175,7 +195,8 @@ h2 {
       box-shadow 200ms ease,
       background-color 150ms ease;
   }
-  .start-button-idle:hover {
+  .start-button-idle:hover,
+  .start-button-raised {
     transform: translateY(-1px);
     box-shadow:
       0 10px 22px -6px rgba(0, 0, 0, 0.5),

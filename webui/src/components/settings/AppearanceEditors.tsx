@@ -1,6 +1,7 @@
 // ------------ Appearance Editors ------------
-// The cards on the Appearance settings tab for picking a custom wallpaper, a custom icon and a colour for each
+// The cards on the Appearance settings tab for picking a custom wallpaper, a custom icon and a color for each
 // game, with a preview and a reset button for each.
+import { useCallback, useRef, useState } from "react";
 import { FolderOpen, Gamepad2, Image as ImageIcon, Palette, RotateCcw } from "lucide-react";
 import { GAMES, gameById } from "../../data/games";
 import type { GameId } from "../../types/game";
@@ -16,11 +17,18 @@ import { CrossfadeMedia } from "../common/CrossfadeMedia";
 import { useRendererSuspended } from "../../lib/useRendererSuspended";
 import { useWindowFocused } from "../../lib/useWindowFocused";
 import { useGamesStore } from "../../store/gamesStore";
+import { ColorPopover } from "../ui/ColorPicker";
+import { Hint } from "../ui/Tooltip";
 
 const BTN =
   "flex items-center gap-[6px] rounded-ui border border-white/15 bg-white/[0.05] px-3 py-[7px] text-[12.5px] font-medium text-white transition-colors hover:bg-white/10";
 
 const CARD = "rounded-ui border border-white/[0.08] bg-white/[0.05] p-5";
+
+// Every game's default color, then a few extras, so the picker opens with two full rows of presets.
+const COLOR_PRESETS = [
+  ...new Set([...GAMES.map((g) => gameColor(g.id)), "#ffffff", "#f472b6", "#34d399", "#60a5fa"]),
+].slice(0, 16);
 
 function GamePicker({
   value,
@@ -41,25 +49,26 @@ function GamePicker({
       {listed.map((g) => {
         const active = value === g.id;
         return (
-          <button
-            key={g.id}
-            onClick={() => onChange(g.id)}
-            aria-pressed={active}
-            title={g.name}
-            className={`flex items-center gap-[8px] rounded-ui border px-[10px] py-[7px] text-[12.5px] font-medium transition-colors ${
-              active
-                ? "border-(--accent-b)/60 bg-(--accent-b)/12 text-white"
-                : "border-white/10 text-white/60 hover:border-white/25 hover:bg-white/[0.06] hover:text-white/90"
-            }`}
-          >
-            <img
-              src={iconSrcFor(g.id, icons)}
-              onError={iconFallback(g.id)}
-              alt=""
-              className="h-[22px] w-[22px] rounded-[5px] object-cover"
-            />
-            <span>{g.short ?? g.name}</span>
-          </button>
+          <Hint key={g.id} tip={g.name}>
+            <button
+              onClick={() => onChange(g.id)}
+              aria-pressed={active}
+              aria-label={g.name}
+              className={`flex items-center gap-[8px] rounded-ui border px-[10px] py-[7px] text-[12.5px] font-medium transition-colors ${
+                active
+                  ? "border-(--accent-b)/60 bg-(--accent-b)/12 text-white"
+                  : "border-white/10 text-white/60 hover:border-white/25 hover:bg-white/[0.06] hover:text-white/90"
+              }`}
+            >
+              <img
+                src={iconSrcFor(g.id, icons)}
+                onError={iconFallback(g.id)}
+                alt=""
+                className="h-[22px] w-[22px] rounded-[5px] object-cover"
+              />
+              <span>{g.short ?? g.name}</span>
+            </button>
+          </Hint>
         );
       })}
     </div>
@@ -190,70 +199,99 @@ export function GameColorsCard() {
       <div className="mb-3 flex items-start justify-between gap-4">
         <div>
           <h5 className="flex items-center gap-2 text-[14px] font-medium text-white">
-            <Palette size={15} /> Game colours
+            <Palette size={15} /> Game colors
           </h5>
           <p className="mt-1 text-[12.5px] text-white/55">
-            The colour each game is drawn in on the Playtime charts.
+            The color each game is drawn in on the Playtime charts.
           </p>
         </div>
         {customCount > 0 && (
-          <button
-            onClick={() => listed.forEach((g) => setPlaytimeColor(g.id, null))}
-            className={BTN}
-            title="Put every game back to its default colour"
-          >
-            <RotateCcw size={14} /> Reset all
-          </button>
+          <Hint tip="Put every game back to its default color" placement="left">
+            <button onClick={() => listed.forEach((g) => setPlaytimeColor(g.id, null))} className={BTN}>
+              <RotateCcw size={14} /> Reset all
+            </button>
+          </Hint>
         )}
       </div>
 
       <div className="flex flex-col gap-[2px]">
-        {listed.map((game) => {
-          const custom = isGameColor(overrides[game.id]);
-          const value = gameColor(game.id, overrides);
-          return (
-            <div
-              key={game.id}
-              className="flex items-center gap-3 rounded-[8px] px-2 py-[7px] transition-colors hover:bg-white/[0.04]"
-            >
-              <img
-                src={iconSrcFor(game.id, gameIcons)}
-                onError={iconFallback(game.id)}
-                alt=""
-                className="h-[22px] w-[22px] shrink-0 rounded-[4px] object-cover"
-              />
-              <span className="min-w-0 flex-1 truncate text-[13px] text-white/80">
-                {game.name}
-              </span>
-              <span className="shrink-0 font-mono text-[11.5px] uppercase text-white/55">
-                {value}
-              </span>
-              <label
-                className="relative h-[24px] w-[34px] shrink-0 cursor-pointer overflow-hidden rounded-[6px] border border-white/15 has-[>input:focus-visible]:outline-2 has-[>input:focus-visible]:outline-offset-2 has-[>input:focus-visible]:outline-(--accent-a)"
-                style={{ background: value }}
-                title={`Change the colour for ${game.name}`}
-              >
-                <input
-                  type="color"
-                  value={value}
-                  onChange={(e) => setPlaytimeColor(game.id, e.target.value)}
-                  aria-label={`Colour for ${game.name}`}
-                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-                />
-              </label>
-              <button
-                onClick={() => setPlaytimeColor(game.id, null)}
-                disabled={!custom}
-                title={custom ? `Reset ${game.name}` : "Already the default colour"}
-                aria-label={`Reset the colour for ${game.name}`}
-                className="grid h-[24px] w-[24px] shrink-0 place-items-center rounded-[6px] border border-white/[0.08] bg-white/[0.04] text-white/60 transition-colors hover:bg-white/[0.1] hover:text-white disabled:cursor-not-allowed disabled:opacity-25"
-              >
-                <RotateCcw size={12} />
-              </button>
-            </div>
-          );
-        })}
+        {listed.map((game) => (
+          <GameColorRow
+            key={game.id}
+            gameId={game.id}
+            name={game.name}
+            icons={gameIcons}
+            custom={isGameColor(overrides[game.id])}
+            value={gameColor(game.id, overrides)}
+            onChange={setPlaytimeColor}
+          />
+        ))}
       </div>
+    </div>
+  );
+}
+
+function GameColorRow({
+  gameId,
+  name,
+  icons,
+  custom,
+  value,
+  onChange,
+}: {
+  gameId: GameId;
+  name: string;
+  icons: Record<string, MediaSlice>;
+  custom: boolean;
+  value: string;
+  onChange: (id: GameId, color: string | null) => void;
+}) {
+  const swatchRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
+
+  return (
+    <div
+      className={`flex items-center gap-3 rounded-[8px] px-2 py-[7px] transition-colors hover:bg-white/[0.04] ${open ? "bg-white/[0.04]" : ""}`}
+    >
+      <img
+        src={iconSrcFor(gameId, icons)}
+        onError={iconFallback(gameId)}
+        alt=""
+        className="h-[22px] w-[22px] shrink-0 rounded-[4px] object-cover"
+      />
+      <span className="min-w-0 flex-1 truncate text-[13px] text-white/80">{name}</span>
+      <span className="shrink-0 font-mono text-[11.5px] uppercase text-white/55">{value}</span>
+      <button
+        ref={swatchRef}
+        onClick={() => setOpen((o) => !o)}
+        aria-label={`Change the color for ${name}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        className={`h-[24px] w-[34px] shrink-0 rounded-[6px] border transition duration-150 hover:scale-[1.06] active:scale-[0.96] ${
+          open ? "border-white/70 ring-2 ring-white/25" : "border-white/15"
+        }`}
+        style={{ background: value }}
+      />
+      <ColorPopover
+        open={open}
+        onClose={close}
+        anchorRef={swatchRef}
+        value={value}
+        onChange={(hex) => onChange(gameId, hex)}
+        presets={COLOR_PRESETS}
+        label={`Color for ${name}`}
+      />
+      <Hint tip={custom ? `Reset ${name} to its default color` : undefined} placement="left" className="flex shrink-0">
+        <button
+          onClick={() => onChange(gameId, null)}
+          disabled={!custom}
+          aria-label={`Reset the color for ${name}`}
+          className="grid h-[24px] w-[24px] place-items-center rounded-[6px] border border-white/[0.08] bg-white/[0.04] text-white/60 transition-colors hover:bg-white/[0.1] hover:text-white disabled:cursor-not-allowed disabled:opacity-25"
+        >
+          <RotateCcw size={12} />
+        </button>
+      </Hint>
     </div>
   );
 }

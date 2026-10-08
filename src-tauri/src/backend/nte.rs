@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
 use md5::{Digest, Md5};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -324,7 +324,7 @@ pub fn decode_container(raw: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
         return Err("NTE resource list payload is not block aligned".to_string());
     }
     let plain = Aes128CbcDec::new(key.into(), CRYPTO_IV.into())
-        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .decrypt_padded::<Pkcs7>(&mut buffer)
         .map_err(|_| "NTE resource list failed to decrypt".to_string())?;
 
     let mut xml = Vec::new();
@@ -2502,5 +2502,17 @@ mod tests {
                 .unwrap();
         assert_eq!(plan.fetch[0].segments, wanted.segments);
         assert_eq!(plan.total_bytes, wanted.size);
+    }
+
+    // A container built with aes 0.8 / cbc 0.1. Pinned so a crate upgrade that changed CBC or
+    // padding handling would fail here instead of on the live NTE resource list.
+    #[test]
+    fn a_pinned_container_still_decodes() {
+        let raw = hex::decode(
+            "50617463686572584d4c300017000000f396f7631f828281094c269cf67fd3ee745c86fb8d0e846fcf1e681eca909320",
+        )
+        .unwrap();
+        assert_eq!(decode_container(&raw, &[0x11; 16]).unwrap(), b"<ResourceList kat='1'/>".to_vec());
+        assert!(decode_container(&raw, &[0x12; 16]).is_err());
     }
 }

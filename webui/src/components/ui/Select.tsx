@@ -188,7 +188,7 @@ export function Select({
       className="flex cursor-pointer select-none items-center gap-2 pl-[14px] pr-[11px] text-[13px] font-medium text-white transition-colors hover:bg-white/[0.05]"
       style={{ height: layout.triggerH - 2 }}
     >
-      <span className="truncate">{selected?.label ?? value}</span>
+      <span className="min-w-0 flex-1 truncate">{selected?.label ?? value}</span>
       <ChevronDown
         size={15}
         className={`shrink-0 text-white/50 transition-transform duration-150 ${open ? "rotate-180" : ""}`}
@@ -240,10 +240,19 @@ export function Select({
         onClick={() => (open ? close() : openMenu())}
         onKeyDown={onKeyDown}
         className={`flex items-center gap-2 rounded-ui border border-white/15 bg-black/30 py-[8px] pl-[14px] pr-[11px] text-[13px] font-medium text-white transition duration-150 hover:bg-black/40 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 ${
-          overlayVisible ? "opacity-0" : ""
+          open && layout ? "opacity-0" : ""
         }`}
       >
-        <span className="truncate">{selected?.label ?? value}</span>
+        {/* Every label sits invisibly in the same grid cell, so the box is always as wide as the longest option and
+            picking one never resizes it (or nudges what sits next to it). */}
+        <span className="grid min-w-0 text-left">
+          {options.map((o) => (
+            <span key={o.value} aria-hidden className="invisible col-start-1 row-start-1 truncate">
+              {o.label}
+            </span>
+          ))}
+          <span className="col-start-1 row-start-1 truncate">{selected?.label ?? value}</span>
+        </span>
         <ChevronDown
           size={15}
           className={`shrink-0 text-white/50 transition-transform duration-150 ${open ? "rotate-180" : ""}`}
@@ -252,12 +261,17 @@ export function Select({
 
       {overlayVisible &&
         createPortal(
-          <div
+          // While closing, the real button is already showing underneath and this fades out over it, so the box
+          // never shows as the menu's solid dark background on its way back.
+          <m.div
             ref={menuRef}
             id={listId}
             role="listbox"
             aria-label={ariaLabel}
             style={layout.style}
+            initial={false}
+            animate={{ opacity: open ? 1 : 0 }}
+            transition={{ duration: reduce ? 0 : 0.22, ease: [0.4, 0, 0.2, 1] }}
             className="z-(--z-tooltip) flex flex-col overflow-hidden rounded-ui border border-white/15 bg-[rgba(20,20,26,0.97)] shadow-2xl"
           >
             {!layout.flipUp && triggerRow}
@@ -286,7 +300,7 @@ export function Select({
               )}
             </AnimatePresence>
             {layout.flipUp && triggerRow}
-          </div>,
+          </m.div>,
           document.body,
         )}
     </>

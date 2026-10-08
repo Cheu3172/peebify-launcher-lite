@@ -14,7 +14,7 @@ use super::game_profiles::InstallMode;
 use super::state::BackendState;
 use super::{
     bd2, bluepoch, download_engine, err_response, game_profiles, gf2, http, hypergryph,
-    hypergryph_reconcile as reconcile, nte, ok_with, sophon,
+    hypergryph_reconcile as reconcile, nte, ok_with, sophon, yostar,
 };
 
 const PREVIEW_CACHE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -226,6 +226,10 @@ async fn nte_preview(profile: &Value) -> Result<Preview, String> {
     })
 }
 
+async fn yostar_preview(profile: &Value) -> Result<Preview, String> {
+    Ok(resource_list_preview(yostar::resolve_config(profile).await?))
+}
+
 async fn gf2_preview(profile: &Value) -> Result<Preview, String> {
     let config = gf2::fetch_config(profile).await?;
     let client_bytes = http::content_length(&config.client_url).await.unwrap_or(0);
@@ -291,21 +295,40 @@ async fn bd2_preview(profile: &Value) -> Result<Preview, String> {
     })
 }
 
+async fn dna_preview(profile: &Value) -> Result<Preview, String> {
+    let (_, package) = super::dna::fetch_package(profile, None, false).await?;
+    Ok(Preview {
+        version: package.version.to_string(),
+        download_bytes: package.download_bytes,
+        install_bytes: package.install_bytes,
+        file_count: 1,
+        approximate: true,
+        parts: merge_parts(&[(
+            "game".to_string(),
+            "game client".to_string(),
+            package.download_bytes,
+            1,
+        )]),
+    })
+}
+
 async fn build_preview(profile: &Value, quality: Option<&str>) -> Result<Preview, String> {
     match game_profiles::install_mode(profile) {
         Some("sophon") => sophon_preview(profile).await,
         Some("bluepoch") => bluepoch_preview(profile).await,
         Some("bd2") => bd2_preview(profile).await,
+        Some("dna") => dna_preview(profile).await,
         Some("hypergryph") => hypergryph_preview(profile).await,
         Some("gf2") => gf2_preview(profile).await,
         Some("netease") => nte_preview(profile).await,
+        Some("yostar") => yostar_preview(profile).await,
         _ => kuro_preview(profile, quality).await,
     }
 }
 
 fn required_free(mode: InstallMode, download_bytes: u64, install_bytes: u64) -> u64 {
     let (write_bytes, multiplier) = match mode {
-        InstallMode::Bd2 => (download_bytes.saturating_add(install_bytes), 1.0),
+        InstallMode::Bd2 | InstallMode::Dna => (download_bytes.saturating_add(install_bytes), 1.0),
         InstallMode::Hypergryph if install_bytes > 0 => {
             (download_bytes.saturating_add(install_bytes), 1.0)
         }

@@ -1269,6 +1269,10 @@ async fn run_verify(
             return bd2_verify(app, profile, profile_id, game_path, &cancel_flag).await;
         }
 
+        if game_profiles::install_mode(profile) == Some("dna") {
+            return dna_verify(app, profile, profile_id, game_path, &cancel_flag).await;
+        }
+
         if game_profiles::install_mode(profile) == Some("netease") {
             let (invalid, remote_version) = nte_invalid_files(
                 app,
@@ -1850,6 +1854,123 @@ async fn bd2_verify(
     Ok(ok_with(
         json!({ "invalidFiles": invalid, "message": message }),
     ))
+}
+
+/// Checks every file against the MD5 list Pan Studio publishes for the build. A build behind the latest is not checked against
+/// the latest's list; it is reported as needing the update.
+async fn dna_verify(
+    app: &AppHandle,
+    profile: &'static Value,
+    profile_id: &str,
+    game_path: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Value, VerifyError> {
+    let name = game_profiles::display_name(profile);
+    let root = PathBuf::from(game_path);
+    let tick = |percentage: u32, status: &str| {
+        super::queue::publish(
+            app,
+            "download-progress",
+            verify_update(Phase::Verifying),
+            json!({ "gameId": profile_id, "status": status, "percentage": percentage }),
+        );
+    };
+    tick(3, "Verifying installed files...");
+
+    if !root.is_dir() {
+        return Err(VerifyError::Other(format!(
+            "{name} is no longer in {game_path}. Point Peebify at it again with Locate existing install, or reinstall it."
+        )));
+    }
+    let manifest = super::dna::fetch_manifest(profile)
+        .await
+        .map_err(|e| VerifyError::Other(format!("Could not reach Pan Studio for the {name} file list: {e}")))?;
+    let installed = super::dna::installed_version(&root);
+    if installed.is_some_and(|v| v != manifest.latest) {
+        let message = format!(
+            "{name} is on build {} while build {} is out, so its files are checked after the update.",
+            installed.unwrap_or_default(),
+            manifest.latest
+        );
+        log::info!("{name} verify: {message}");
+        return Ok(ok_with(json!({ "invalidFiles": [], "message": message, "updatePending": true })));
+    }
+
+    tick(6, "Verifying installed files: fetching the file list...");
+    let hashes = super::dna::fetch_hashes(profile, &manifest)
+        .await
+        .map_err(|e| VerifyError::Other(format!("Could not load the {name} file list: {e}")))?;
+    let file_count = hashes.len();
+    let total_bytes = super::dna::listed_bytes(&root, &hashes);
+    log::info!("{name} verify: checksumming {file_count} file(s) listed for build {}.", manifest.latest);
+
+    let emitter = app.clone();
+    let game_id = profile_id.to_string();
+    let verify_root = root.clone();
+    let verify_cancel = Arc::clone(cancel);
+    let files = hashes.clone();
+    let hashed = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&hashed);
+    let last_tick = Mutex::new(std::time::Instant::now());
+    let broken = tauri::async_runtime::spawn_blocking(move || {
+        super::dna::verify_files(&verify_root, &files, &verify_cancel, |bytes| {
+            let done = counter.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            let mut guard = last_tick.lock();
+            if guard.elapsed() < std::time::Duration::from_millis(120) {
+                return;
+            }
+            *guard = std::time::Instant::now();
+            drop(guard);
+            let percentage = if total_bytes > 0 {
+                ((done as f64 / total_bytes as f64) * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            super::queue::publish(
+                &emitter,
+                "download-progress",
+                verify_update(Phase::Verifying),
+                json!({
+                    "gameId": game_id,
+                    "status": "Verifying file integrity...",
+                    "percentage": percentage,
+                    "processedBytes": done,
+                    "totalBytes": total_bytes,
+                }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| VerifyError::Other(format!("verify task panicked: {e}")))?
+    .map_err(|e| verify_failure(cancel, e))?;
+
+    if installed.is_none() && broken.is_empty() {
+        let _ = super::dna::write_installed_version(&root, manifest.latest);
+    }
+    let invalid: Vec<Value> = broken.iter().map(|f| json!({ "dest": f.path, "size": 0 })).collect();
+    let message = if broken.is_empty() {
+        format!("{name} is intact. All {file_count} files match the checksums for build {}.", manifest.latest)
+    } else {
+        format!(
+            "{} of {file_count} {name} files do not match build {}. Repair replaces them.",
+            broken.len(),
+            manifest.latest
+        )
+    };
+    log::info!("{name} verify: {message}");
+    super::queue::publish(
+        app,
+        "download-progress",
+        verify_result_update(broken.len()),
+        json!({
+            "gameId": profile_id,
+            "status": if broken.is_empty() { "Verification Complete" } else { "Verification Failed" },
+            "percentage": 100,
+            "message": message,
+            "error": if broken.is_empty() { Value::Null } else { json!(message) },
+        }),
+    );
+    Ok(ok_with(json!({ "invalidFiles": invalid, "message": message })))
 }
 
 struct VerifyHooks {

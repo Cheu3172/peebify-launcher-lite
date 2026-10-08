@@ -59,7 +59,7 @@ import { OfflineBanner } from "./components/layout/OfflineBanner";
 import { WindowControls } from "./components/layout/WindowControls";
 import { GameHome } from "./components/home/GameHome";
 import { ModalRoot } from "./components/ui/ModalRoot";
-import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ErrorBoundary, retryOrReload } from "./components/ErrorBoundary";
 import { ActionButton } from "./components/ui/ActionButton";
 
 const loadMotionFeatures = () => import("./lib/motionFeatures").then((mod) => mod.default);
@@ -144,11 +144,10 @@ function PageError({ view, onRetry }: { view: string; onRetry: () => void }) {
         It has been written to the log. The rest of the launcher still works.
       </div>
       <div className="flex items-center gap-2">
-        <ActionButton onClick={onRetry}>Try again</ActionButton>
+        <ActionButton onClick={() => retryOrReload(onRetry)}>Try again</ActionButton>
         {view !== "home" && (
           <ActionButton onClick={() => setView("home")}>Back to home</ActionButton>
         )}
-        <ActionButton onClick={() => window.location.reload()}>Reload launcher</ActionButton>
         <ActionButton onClick={() => void openLogsFolder()}>Open logs folder</ActionButton>
       </div>
     </div>

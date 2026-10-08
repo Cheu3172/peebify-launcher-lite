@@ -70,12 +70,15 @@ impl FileValidator {
             return Ok(FileCheck::Valid);
         }
 
-        match super::fs_util::md5_file(
+        match super::fs_util::checksum_file(
             path,
+            expected_md5,
             &mut || cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)),
             &mut |n| on_progress(n),
         ) {
-            Ok(actual) if actual.eq_ignore_ascii_case(expected_md5) => Ok(FileCheck::Valid),
+            Ok(actual) if super::fs_util::checksum_matches(expected_md5, &actual) => {
+                Ok(FileCheck::Valid)
+            }
             Ok(_) => Ok(FileCheck::HashMismatch),
             Err(e) if e == super::fs_util::CANCELLED_MSG => {
                 Err("Validation cancelled".to_string())

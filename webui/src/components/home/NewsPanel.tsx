@@ -116,15 +116,12 @@ export function NewsPanel() {
     const seen = new Set(notices.map(entryKey));
     const news = (data.guidance?.news?.contents ?? []).filter((i) => !seen.has(entryKey(i)));
     const today = new Date();
-    return [
-      ...notices.map((item) => ({ item, notice: true })),
-      ...news.map((item) => ({ item, notice: false })),
-    ]
-      .map((x, order) => ({
-        ...x,
+    return [...notices, ...news]
+      .map((item, order) => ({
+        item,
         order,
-        rank: dateRank(x.item.time, today),
-        date: fmtNewsDate(x.item.time, today),
+        rank: dateRank(item.time, today),
+        date: fmtNewsDate(item.time, today),
       }))
       .sort((a, b) => b.rank - a.rank || a.order - b.order);
   }, [data]);
@@ -218,18 +215,11 @@ export function NewsPanel() {
               ) : items.length === 0 ? (
                 <p className="px-[7px] py-[16px] text-center text-[12px] text-white/40">No news yet.</p>
               ) : (
-                items.map(({ item, notice, date }, idx) => {
+                items.map(({ item, date }, idx) => {
                   const key = `${entryKey(item)}|${idx}`;
                   const body = (
                     <>
-                      <span className="flex min-w-0 items-center gap-[6px]">
-                        {notice && (
-                          <span className="shrink-0 rounded-[4px] bg-white/[0.08] px-[5px] py-[1px] text-[9.5px] font-semibold uppercase tracking-[0.04em] text-white/60">
-                            Notice
-                          </span>
-                        )}
-                        <span className="truncate text-[12.5px] font-medium leading-[1.3]">{item.content}</span>
-                      </span>
+                      <span className="min-w-0 truncate text-[12.5px] font-medium leading-[1.3]">{item.content}</span>
                       <span className="shrink-0 text-[10.5px] text-white/[0.42]">{date}</span>
                     </>
                   );

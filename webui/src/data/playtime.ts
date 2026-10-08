@@ -16,6 +16,9 @@ const GAME_COLORS: Record<GameId, string> = {
   gf1: "#e11d48",
   re1999: "#c9a227",
   bd2: "#94a3b8",
+  arknights: "#3b82f6",
+  bluearchive: "#38bdf8",
+  dna: "#c9a96e",
 };
 
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;

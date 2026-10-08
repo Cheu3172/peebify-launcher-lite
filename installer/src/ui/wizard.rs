@@ -1,6 +1,7 @@
 // ------------ Install Wizard ------------
-// The install window: Welcome, Options (folder, shortcut, Visual C++ runtime, launch afterwards), Progress and Done.
-// The chosen folder is checked in the background and the install itself runs on a worker thread.
+// The install window: Welcome, Options (folder, shortcut, Visual C++ runtime, launch afterwards), Progress, then Done,
+// a warnings page or Failed with Retry. The chosen folder is checked in the background and the install itself runs on
+// a worker thread. Screens switch instantly.
 
 use std::path::PathBuf;
 
@@ -40,6 +41,16 @@ enum Page {
     Done,
 }
 
+#[derive(Clone, Copy, PartialEq, Hash, Debug)]
+enum Screen {
+    Welcome,
+    Options,
+    Progress,
+    Done,
+    Warnings,
+    Failed,
+}
+
 struct WizardApp {
     payload: Payload,
     logo: Option<egui::TextureHandle>,
@@ -57,10 +68,9 @@ struct WizardApp {
     warnings: Vec<String>,
     error: Option<String>,
     launcher_running: bool,
-    closed_launcher: bool,
     running_checked_at: Option<std::time::Instant>,
-    page_changed_at: std::time::Instant,
     chrome: ui::Chrome,
+    copied: ui::Copied,
     launched_at: Option<std::time::Instant>,
     stay_open: bool,
     webview2_missing: bool,
@@ -96,13 +106,12 @@ impl TargetCheck {
         }
     }
 
-    fn size_hint(&self) -> Option<String> {
+    fn size_line(&self) -> Option<String> {
         if self.refusal.is_some() {
             return None;
         }
-        let needed = human_bytes(self.needed);
         let free = self.free.map(human_bytes)?;
-        Some(format!("About {needed} needed, {free} free on that drive."))
+        Some(format!("{} · {free} free", human_bytes(self.needed)))
     }
 }
 
@@ -170,6 +179,9 @@ fn existing_ancestor(path: &str) -> Option<PathBuf> {
 const TARGET_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const TARGET_STALE_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 const CHECKING_FOLDER: &str = "Checking folder…";
+const AUTO_CLOSE: std::time::Duration = std::time::Duration::from_secs(3);
+const REPLACING_NOTICE: &str =
+    "Seems an install already exists! We'll replace only the files needed for this version.";
 
 fn clean_target(raw: &str) -> String {
     raw.trim().trim_matches('"').trim().to_string()
@@ -189,6 +201,13 @@ fn elsewhere_notice(registered: &std::path::Path) -> String {
         registered.display(),
         consts::UNINSTALLER_NAME
     )
+}
+
+fn path_line(ui_: &mut egui::Ui, path: &str) {
+    ui_.add(
+        egui::Label::new(RichText::new(path).size(ui::text::MD).color(ui::tx(0.80))).truncate(),
+    )
+    .on_hover_text(path);
 }
 
 impl WizardApp {
@@ -217,10 +236,9 @@ impl WizardApp {
             warnings: Vec::new(),
             error: None,
             launcher_running: false,
-            closed_launcher: false,
             running_checked_at: None,
-            page_changed_at: std::time::Instant::now(),
             chrome: ui::Chrome::default(),
+            copied: ui::Copied::default(),
             launched_at: None,
             stay_open: false,
             webview2_missing: false,
@@ -233,10 +251,14 @@ impl WizardApp {
         }
     }
 
-    fn goto(&mut self, page: Page) {
-        if self.page != page {
-            self.page = page;
-            self.page_changed_at = std::time::Instant::now();
+    fn screen(&self) -> Screen {
+        match self.page {
+            Page::Welcome => Screen::Welcome,
+            Page::Options => Screen::Options,
+            Page::Progress => Screen::Progress,
+            Page::Done if self.error.is_some() => Screen::Failed,
+            Page::Done if !self.warnings.is_empty() => Screen::Warnings,
+            Page::Done => Screen::Done,
         }
     }
 
@@ -324,19 +346,35 @@ impl WizardApp {
             install_vc_redist: self.vc_redist_missing && self.install_vc_redist,
         };
         let cancel = self.cancel.clone();
-        self.closed_launcher = self.launcher_running();
-        self.goto(Page::Progress);
-        self.pacer = ui::Pacer::new("Starting…");
+        let first = if self.launcher_running() {
+            "Closing the launcher…"
+        } else {
+            "Copying files…"
+        };
+        self.outcome.set(crate::exit::OK);
+        self.page = Page::Progress;
+        self.pacer = ui::Pacer::new(first);
         self.rx = Some(ui::spawn_engine(move |sink| {
             perform_install(&payload, &opts, &cancel, sink)
         }));
+    }
+
+    fn reset_run(&mut self) {
+        self.error = None;
+        self.committed = false;
+        self.cancelling = false;
+        self.cancel = Cancel::default();
+        self.warnings.clear();
+        self.target_check = None;
+        self.target_job = None;
+        self.target_stale_since = None;
     }
 
     fn drain_events(&mut self) {
         let Some(rx) = &self.rx else { return };
         while let Ok(event) = rx.try_recv() {
             match event {
-                EngineEvent::Status { phase, percent } => self.pacer.push(phase, percent),
+                EngineEvent::Status { phase, percent } => self.pacer.report(&phase, percent),
                 EngineEvent::Warning(w) => self.warnings.push(w),
                 EngineEvent::Committed => {
                     self.committed = true;
@@ -351,17 +389,35 @@ impl WizardApp {
                 EngineEvent::Cancelled => {
                     self.outcome.set(crate::exit::CANCELLED);
                     self.rx = None;
-                    self.cancelling = true;
+                    self.reset_run();
+                    self.page = Page::Welcome;
                     return;
                 }
                 EngineEvent::Failed(e) => {
                     self.outcome.set(crate::exit::FAILED);
                     self.error = Some(e);
-                    self.goto(Page::Done);
+                    self.page = Page::Done;
                     self.rx = None;
                     return;
                 }
             }
+        }
+    }
+
+    fn retry(&mut self) {
+        self.reset_run();
+        let path = self.target_path();
+        let check = compute_target_check(
+            &path,
+            self.payload.manifest.estimated_size_kb,
+            self.registered.as_deref(),
+        );
+        let allowed = !check.blocks_install();
+        self.target_check = Some((path, std::time::Instant::now(), check));
+        if allowed {
+            self.start_install();
+        } else {
+            self.page = Page::Options;
         }
     }
 }
@@ -371,7 +427,8 @@ impl eframe::App for WizardApp {
         ui::clear_color()
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
         self.chrome.apply();
         self.drain_events();
         if matches!(self.page, Page::Welcome | Page::Options) {
@@ -380,108 +437,75 @@ impl eframe::App for WizardApp {
         if self.rx.is_some() && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        if self.rx.is_none() && self.outcome.get() == crate::exit::CANCELLED {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        if matches!(self.page, Page::Progress) {
-            self.pacer.tick();
-            if self.pacer.settled() {
-                self.goto(Page::Done);
+        match self.page {
+            Page::Progress => {
+                self.pacer.tick();
+                if self.pacer.settled() {
+                    self.page = Page::Done;
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(80));
-        } else if matches!(self.page, Page::Welcome | Page::Options) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            Page::Welcome | Page::Options => {
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
+            Page::Done => {
+                if self.error.is_none() && !self.webview2_missing {
+                    self.start_launcher_once();
+                }
+            }
         }
 
+        let screen = self.screen();
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            match self.page {
-                Page::Options => self.goto(Page::Welcome),
-                Page::Welcome | Page::Done => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Page::Progress => {}
+            match screen {
+                Screen::Options => self.page = Page::Welcome,
+                Screen::Progress => {}
+                _ => ui::close(ctx),
             }
         }
 
-        let closable = match self.page {
-            Page::Progress => ui::Close::Disabled,
+        let closable = match screen {
+            Screen::Progress => ui::Close::Disabled,
             _ => ui::Close::Enabled,
         };
         let logo = self.logo.clone();
-        let version = self.payload.manifest.version.clone();
-        let failed = self.error.is_some();
-
-        let identity = match self.page {
-            Page::Done if failed => format!("Version {version} · not installed"),
-            Page::Done => format!("Version {version} · installed"),
-            _ => format!("Version {version}"),
+        let identity = format!("Version {}", self.payload.manifest.version);
+        let rail = ui::Rail::new(logo.as_ref(), identity);
+        let rail = match screen {
+            Screen::Welcome | Screen::Options => rail.step(ui::Step::Setup),
+            Screen::Progress => rail
+                .step(ui::Step::Install)
+                .progress(ui::bar_fraction(self.pacer.percent())),
+            Screen::Done => rail.step(ui::Step::Ready).badge(ui::Badge::Done),
+            Screen::Warnings => rail.step(ui::Step::Ready),
+            Screen::Failed => rail.failed(),
         };
-        let mut rail = ui::Rail::new(logo.as_ref(), identity);
-        if failed && self.page == Page::Done {
-            rail = rail.error("ERROR").logo_alpha(0.65);
-        } else {
-            rail = rail.step(match self.page {
-                Page::Welcome | Page::Options => ui::Step::Setup,
-                Page::Progress => ui::Step::Install,
-                Page::Done => ui::Step::Ready,
-            });
-        }
-        let scrim = match self.page {
-            Page::Done if failed => ui::SCRIM_FAILED,
-            Page::Done => ui::SCRIM_DONE,
-            _ => ui::SCRIM_DEFAULT,
+        let mood = match screen {
+            Screen::Welcome | Screen::Options | Screen::Warnings => ui::Mood::CALM,
+            Screen::Progress => ui::Mood::INSTALLING,
+            Screen::Done => ui::Mood::DONE,
+            Screen::Failed => ui::Mood::FAILED,
         };
 
-        ui::split(ctx, ui::Surface::Install, scrim, closable, rail, |body| {
-            const FADE_SECS: f32 = 0.18;
-            let fade = (self.page_changed_at.elapsed().as_secs_f32() / FADE_SECS).clamp(0.0, 1.0);
-            if fade < 1.0 {
-                body.ctx().request_repaint();
-            }
-            body.set_opacity(fade);
-            match self.page {
-                Page::Welcome => self.page_welcome(body),
-                Page::Options => self.page_options(body, frame),
-                Page::Progress => self.page_progress(body),
-                Page::Done => self.page_done(body, ctx),
-            }
+        ui::split(root, mood, closable, rail, |body| match screen {
+            Screen::Welcome => self.page_welcome(body),
+            Screen::Options => self.page_options(body, frame),
+            Screen::Progress => self.page_progress(body),
+            Screen::Done => self.page_done(body, ctx),
+            Screen::Warnings => self.page_warnings(body, ctx),
+            Screen::Failed => self.page_failed(body, ctx),
         });
     }
 }
 
 impl WizardApp {
     fn page_welcome(&mut self, ui_: &mut egui::Ui) {
-        let launcher_running = self.launcher_running();
-        ui_.add_space(16.0);
-        ui::heading(ui_, "Setup", 29.0);
-        ui_.add_space(14.0);
-        ui::paragraph(
-            ui_,
-            "Let's begin the setup and make the official launchers irrelevant, \
-             feel free to fill out your preferences along the way.",
-            ui::text::BODY,
-            ui::tx(0.68),
-            340.0,
-        );
+        ui::group(ui_, |g| {
+            g.add_space(16.0);
+            ui::heading(g, "Setup", 29.0);
+        });
 
-        if launcher_running {
-            ui_.add_space(16.0);
-            ui::bullet_row(
-                ui_,
-                ui::NOTICE,
-                "The launcher's open right now. Don't worry, we'll close it once you \
-                 start the installation.",
-            );
-        }
-        if self.vc_redist_missing && self.install_vc_redist {
-            ui_.add_space(10.0);
-            ui::bullet_row(
-                ui_,
-                ui::NOTICE,
-                "The Microsoft Visual C++ runtime the games need is missing or out of \
-                 date. Setup will install it, and Windows will ask for permission.",
-            );
-        }
-        let (replacing, elsewhere, blocker, hint) = match self.shown_check() {
+        let (replacing, elsewhere, blocker, size) = match self.shown_check() {
             Some(check) => (
                 check.replacing,
                 check.elsewhere.as_deref().map(elsewhere_notice),
@@ -489,142 +513,160 @@ impl WizardApp {
                     .refusal
                     .map(str::to_string)
                     .or_else(|| check.short_of_space()),
-                check.size_hint(),
+                check.size_line(),
             ),
             None => (false, None, None, Some(CHECKING_FOLDER.to_string())),
         };
-        if replacing {
-            ui_.add_space(10.0);
-            ui::bullet_row(
-                ui_,
-                ui::NOTICE,
-                "Seems an install already exists! We'll replace only the files needed \
-                 for this version.",
+        let mut notices: Vec<String> = Vec::new();
+        if self.vc_redist_missing && self.install_vc_redist {
+            notices.push(
+                "The Microsoft Visual C++ runtime the games need is missing or out of date. \
+                 Setup will install it, and Windows will ask for permission."
+                    .to_string(),
             );
         }
-        if let Some(elsewhere) = elsewhere {
-            ui_.add_space(10.0);
-            ui::bullet_row(ui_, ui::NOTICE, &elsewhere);
+        if replacing {
+            notices.push(REPLACING_NOTICE.to_string());
         }
+        notices.extend(elsewhere);
+
+        ui::group(ui_, |g| {
+            g.add_space(14.0);
+            ui::paragraph(
+                g,
+                "Let's begin the setup and make the official launchers irrelevant, \
+                 feel free to fill out your preferences along the way.",
+                ui::text::BODY,
+                ui::tx(0.68),
+                340.0,
+            );
+            for (i, notice) in notices.iter().enumerate() {
+                g.add_space(if i == 0 { 16.0 } else { 10.0 });
+                ui::bullet_row(g, ui::NOTICE, notice);
+            }
+        });
 
         let ok = self.install_ready();
         let path = self.target_path();
         let mut start = false;
         let mut customize = false;
         ui::footer(ui_, |foot| {
-            ui::action_row(foot, true, |row| {
-                start = row
-                    .add_enabled_ui(ok, |row| ui::primary_button(row, "Install"))
-                    .inner
-                    .clicked();
-                row.add_space(10.0);
-                customize = ui::secondary_button(row, "Customize").clicked();
+            ui::group(foot, |foot| {
+                ui::action_row(foot, true, |row| {
+                    start = row
+                        .add_enabled_ui(ok, |row| ui::primary_button(row, "Install"))
+                        .inner
+                        .clicked();
+                    row.add_space(10.0);
+                    customize = ui::secondary_button(row, "Customize").clicked();
+                });
             });
             foot.add_space(14.0);
-            if let Some(blocker) = blocker {
-                foot.label(
-                    RichText::new(blocker)
-                        .size(ui::text::XS)
-                        .color(ui::DANGER_TEXT),
-                );
+            ui::group(foot, |foot| {
+                if let Some(blocker) = blocker {
+                    foot.label(
+                        RichText::new(blocker)
+                            .size(ui::text::XS)
+                            .color(ui::DANGER_TEXT),
+                    );
+                    foot.add_space(3.0);
+                } else if let Some(size) = size {
+                    foot.label(RichText::new(size).size(ui::text::XS).color(ui::tx(0.56)));
+                    foot.add_space(3.0);
+                }
+                path_line(foot, &path);
                 foot.add_space(3.0);
-            } else if let Some(hint) = hint {
-                foot.label(RichText::new(hint).size(ui::text::XS).color(ui::tx(0.56)));
-                foot.add_space(3.0);
-            }
-            foot.label(RichText::new(path).size(ui::text::MD).color(ui::tx(0.80)));
-            foot.add_space(3.0);
-            ui::meta_label(foot, "Goes to");
-            foot.add_space(14.0);
-            ui::hairline(foot);
+                ui::meta_label(foot, "Goes to");
+                foot.add_space(14.0);
+                ui::hairline(foot);
+            });
         });
 
         if customize {
-            self.goto(Page::Options);
+            self.page = Page::Options;
         } else if (start || Self::enter_pressed(ui_)) && ok {
             self.start_install();
         }
     }
 
     fn page_options(&mut self, ui_: &mut egui::Ui, frame: &eframe::Frame) {
-        ui_.add_space(8.0);
-        ui::heading(ui_, "Preferences", 22.0);
-        ui_.add_space(18.0);
+        ui::group(ui_, |g| {
+            g.add_space(8.0);
+            ui::heading(g, "Preferences", 22.0);
+        });
 
-        ui_.label(
-            RichText::new("Install folder")
-                .size(ui::text::SM)
-                .color(ui::tx(0.60)),
-        );
-        ui_.add_space(7.0);
-        ui_.horizontal(|row| {
-            let width = row.available_width() - 100.0;
-            ui::text_field(row, &mut self.install_dir, egui::vec2(width, 36.0));
-            row.add_space(8.0);
-            if ui::small_button(row, "Browse…").clicked() {
-                let mut dialog = rfd::FileDialog::new()
-                    .set_title("Choose install folder")
-                    .set_parent(frame);
-                if let Some(start) = existing_ancestor(&clean_target(&self.install_dir)) {
-                    dialog = dialog.set_directory(start);
+        ui::group(ui_, |g| {
+            g.add_space(18.0);
+            g.label(
+                RichText::new("Install folder")
+                    .size(ui::text::SM)
+                    .color(ui::tx(0.60)),
+            );
+            g.add_space(7.0);
+            g.horizontal(|row| {
+                row.spacing_mut().item_spacing.x = 0.0;
+                let width = row.available_width() - 8.0 - 84.0;
+                ui::text_field(row, &mut self.install_dir, egui::vec2(width, 36.0));
+                row.add_space(8.0);
+                if ui::small_button(row, "Browse…").clicked() {
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_title("Choose install folder")
+                        .set_parent(frame);
+                    if let Some(start) = existing_ancestor(&clean_target(&self.install_dir)) {
+                        dialog = dialog.set_directory(start);
+                    }
+                    if let Some(dir) = dialog.pick_folder() {
+                        let dir =
+                            if dir.file_name().map(|n| n == consts::PRODUCT_NAME) == Some(true) {
+                                dir
+                            } else {
+                                dir.join(consts::PRODUCT_NAME)
+                            };
+                        self.install_dir = dir.display().to_string();
+                    }
                 }
-                if let Some(dir) = dialog.pick_folder() {
-                    let dir = if dir.file_name().map(|n| n == consts::PRODUCT_NAME) == Some(true) {
-                        dir
-                    } else {
-                        dir.join(consts::PRODUCT_NAME)
-                    };
-                    self.install_dir = dir.display().to_string();
-                }
+            });
+            g.add_space(7.0);
+            self.target_feedback(g);
+        });
+
+        ui::group(ui_, |g| {
+            g.add_space(22.0);
+            ui::checkbox(g, &mut self.desktop_shortcut, "Desktop shortcut");
+            g.add_space(14.0);
+            ui::checkbox(g, &mut self.launch_after, "Open when finished");
+            if self.vc_redist_missing {
+                g.add_space(14.0);
+                ui::checkbox(g, &mut self.install_vc_redist, "Visual C++ runtime");
+                g.add_space(3.0);
+                ui::sub_note(
+                    g,
+                    "Kuro Games, HoYoverse, and Gryphline all use this framework. We can \
+                     install it for you if you like.",
+                );
             }
         });
-        ui_.add_space(7.0);
-        self.target_feedback(ui_);
-
-        ui_.add_space(20.0);
-        ui::checkbox(
-            ui_,
-            &mut self.desktop_shortcut,
-            "Put a shortcut on my desktop",
-        );
-        ui_.add_space(14.0);
-        ui::checkbox(
-            ui_,
-            &mut self.launch_after,
-            "Open the launcher when setup finishes",
-        );
-        if self.vc_redist_missing {
-            ui_.add_space(14.0);
-            ui::checkbox(
-                ui_,
-                &mut self.install_vc_redist,
-                "Install or update the Microsoft Visual C++ runtime",
-            );
-            ui_.add_space(3.0);
-            ui::sub_note(
-                ui_,
-                "Kuro Games, HoYoverse, and Gryphline all use this framework. We can \
-                 install it for you if you like.",
-            );
-        }
 
         let ok = self.install_ready();
         let mut back = false;
         let mut start = false;
         ui::footer(ui_, |foot| {
-            ui::action_row(foot, false, |row| {
-                back = ui::secondary_button(row, "Back").clicked();
-                row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
-                    start = row
-                        .add_enabled_ui(ok, |row| ui::primary_button(row, "Install"))
-                        .inner
-                        .clicked();
-                });
+            ui::group(foot, |foot| {
+                ui::action_row_split(
+                    foot,
+                    |left| back = ui::secondary_button(left, "Back").clicked(),
+                    |right| {
+                        start = right
+                            .add_enabled_ui(ok, |row| ui::primary_button(row, "Install"))
+                            .inner
+                            .clicked();
+                    },
+                );
             });
         });
 
         if back {
-            self.goto(Page::Welcome);
+            self.page = Page::Welcome;
         } else if start {
             self.start_install();
         }
@@ -639,13 +681,12 @@ impl WizardApp {
             );
             return;
         };
-        let (refusal, free, needed, replacing, foreign, short, elsewhere) = (
+        let (refusal, replacing, foreign, short, size, elsewhere) = (
             check.refusal,
-            check.free,
-            check.needed,
             check.replacing,
             check.foreign,
             check.short_of_space(),
+            check.size_line(),
             check.elsewhere.as_deref().map(elsewhere_notice),
         );
 
@@ -658,29 +699,18 @@ impl WizardApp {
             return;
         }
 
-        match (free, short) {
-            (_, Some(short)) => {
+        match (short, size) {
+            (Some(short), _) => {
                 ui_.label(RichText::new(short).size(ui::text::XS).color(ui::DANGER_TEXT));
             }
-            (Some(free), None) => {
-                ui_.label(
-                    RichText::new(format!(
-                        "Needs about {}, {} free.",
-                        human_bytes(needed),
-                        human_bytes(free)
-                    ))
-                    .size(ui::text::XS)
-                    .color(ui::tx(0.56)),
-                );
+            (None, Some(size)) => {
+                ui_.label(RichText::new(size).size(ui::text::XS).color(ui::tx(0.56)));
             }
             (None, None) => {}
         }
 
         let notice = if replacing {
-            Some(
-                "Seems an install already exists! We'll replace only the files needed \
-                 for this version.",
-            )
+            Some(REPLACING_NOTICE)
         } else if foreign {
             Some(
                 "This folder already has files in it. Setup will add to it, and \
@@ -706,58 +736,50 @@ impl WizardApp {
     }
 
     fn page_progress(&mut self, ui_: &mut egui::Ui) {
-        ui_.add_space(14.0);
-        ui::heading(ui_, "Unpacking", 25.0);
-        ui_.add_space(26.0);
-        let percent = self.pacer.percent();
-        ui_.horizontal(|row| {
-            row.label(
-                RichText::new(if self.cancelling {
-                    "Stopping…"
-                } else {
-                    self.pacer.phase()
-                })
-                .size(ui::text::BASE)
-                .color(ui::tx(0.85)),
-            );
-            if percent >= 0.0 {
-                row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |row| {
-                    row.label(
-                        RichText::new(format!("{}%", percent.round() as i32))
-                            .size(12.0)
-                            .color(ui::tx(0.50)),
-                    );
-                });
-            }
+        ui::group(ui_, |g| {
+            g.add_space(14.0);
+            ui::heading(g, "Installing", 25.0);
         });
-        ui_.add_space(10.0);
-        ui::progress_bar(ui_, ui::bar_fraction(percent));
-        if self.closed_launcher {
-            ui_.add_space(10.0);
-            ui_.label(
-                RichText::new("The launcher was open, so we went ahead and closed that for you.")
-                    .size(ui::text::XS)
-                    .color(ui::tx(0.56)),
-            );
+        let percent = self.pacer.percent();
+        let label = if self.cancelling {
+            "Stopping…"
+        } else {
+            self.pacer.phase()
         }
+        .to_string();
+        ui::group(ui_, |g| {
+            g.add_space(26.0);
+            ui::progress_readout(g, &label, percent, ui::text::BASE, 12.0);
+            g.add_space(10.0);
+            ui::progress_bar(
+                g,
+                egui::Id::new("install-progress"),
+                ui::bar_fraction(percent),
+                ui::BAR_STEADY,
+            );
+        });
 
         let stoppable = !self.cancelling && !self.committed && self.rx.is_some();
         let mut stop = false;
-        ui::footer(ui_, |foot| {
-            ui::action_row(foot, true, |row| {
-                let button = row
-                    .add_enabled_ui(stoppable, |row| ui::secondary_button(row, "Cancel"))
-                    .inner;
-                let button = if self.committed {
-                    button.on_disabled_hover_text(
-                        "Too late to cancel now, setup is finishing up.",
-                    )
-                } else {
-                    button
-                };
-                stop = button.clicked();
+        if self.rx.is_some() {
+            ui::footer(ui_, |foot| {
+                ui::group(foot, |foot| {
+                    ui::action_row(foot, true, |row| {
+                        let button = row
+                            .add_enabled_ui(stoppable, |row| ui::secondary_button(row, "Cancel"))
+                            .inner;
+                        let button = if self.committed {
+                            button.on_disabled_hover_text(
+                                "Too late to cancel now, setup is finishing up.",
+                            )
+                        } else {
+                            button
+                        };
+                        stop = button.clicked();
+                    });
+                });
             });
-        });
+        }
         if stop {
             self.cancelling = true;
             self.cancel.cancel();
@@ -765,123 +787,135 @@ impl WizardApp {
     }
 
     fn page_done(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context) {
-        if let Some(err) = self.error.clone() {
-            self.page_failed(ui_, ctx, &err);
-            return;
-        }
-        if !self.webview2_missing {
-            self.start_launcher_once();
-        }
-
-        if !self.warnings.is_empty() {
-            self.page_warnings(ui_, ctx);
-            return;
-        }
-
-        ui_.add_space(16.0);
-        ui::heading(ui_, "All set", 32.0);
-        ui_.add_space(14.0);
-        ui::paragraph(
-            ui_,
-            if self.launched_at.is_some() {
-                "The launcher is opening now, have fun!"
-            } else {
-                "Peebify Launcher is installed and ready whenever you are."
-            },
-            ui::text::BODY,
-            ui::tx(0.68),
-            330.0,
-        );
+        ui::group(ui_, |g| {
+            g.add_space(16.0);
+            ui::heading(g, "All set", 32.0);
+        });
+        let launched = self.launched_at.is_some();
+        ui::group(ui_, |g| {
+            g.add_space(12.0);
+            ui::paragraph(
+                g,
+                if launched {
+                    "Opening the launcher."
+                } else {
+                    "Ready when you are."
+                },
+                ui::text::BODY,
+                ui::tx(0.68),
+                330.0,
+            );
+        });
 
         let countdown = self.auto_close_remaining();
         if let Some(left) = countdown {
             if left.is_zero() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ui::close(ctx);
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
+        let can_launch = !launched && !self.webview2_missing;
+        let label = match countdown {
+            Some(left) => format!("Close ({})", (left.as_secs() + 1).min(AUTO_CLOSE.as_secs())),
+            None if can_launch => "Launch".to_string(),
+            None => "Close".to_string(),
+        };
 
         let path = self.target_path();
-        let label = match countdown {
-            Some(left) => format!("Close ({})", left.as_secs() + 1),
-            None => "Finish".to_string(),
-        };
-        let mut close = false;
+        let mut primary = false;
         let mut open_folder = false;
         ui::footer(ui_, |foot| {
-            ui::action_row(foot, true, |row| {
-                close = ui::primary_button(row, &label).clicked();
-                row.add_space(10.0);
-                open_folder = ui::secondary_button(row, "Open folder").clicked();
+            ui::group(foot, |foot| {
+                ui::action_row(foot, true, |row| {
+                    primary = ui::primary_button(row, &label).clicked();
+                    row.add_space(10.0);
+                    open_folder = ui::secondary_button(row, "Open folder").clicked();
+                });
             });
             foot.add_space(14.0);
-            foot.label(RichText::new(&path).size(ui::text::MD).color(ui::tx(0.80)));
-            foot.add_space(3.0);
-            ui::meta_label(foot, "Installed at");
-            foot.add_space(14.0);
-            ui::hairline(foot);
+            ui::group(foot, |foot| {
+                path_line(foot, &path);
+                foot.add_space(3.0);
+                ui::meta_label(foot, "Installed at");
+                foot.add_space(14.0);
+                ui::hairline(foot);
+            });
         });
 
         if open_folder {
             self.stay_open = true;
             crate::win::open_folder(&PathBuf::from(&path));
-        } else if close || Self::enter_pressed(ui_) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if primary || Self::enter_pressed(ui_) {
+            if can_launch {
+                self.launch_after = true;
+                self.start_launcher_once();
+                if self.warnings.is_empty() {
+                    ui::close(ctx);
+                }
+            } else {
+                ui::close(ctx);
+            }
         }
     }
 
     fn page_warnings(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context) {
-        ui_.add_space(12.0);
-        ui::heading(ui_, "Installed, but with errors", 28.0);
-        ui_.add_space(20.0);
-        let warnings = self.warnings.clone();
-        ui::card(ui_, ui::Tone::Notice, 13, |card| {
-            egui::ScrollArea::vertical()
-                .max_height(200.0)
-                .auto_shrink([false, true])
-                .show(card, |list| {
-                    for (i, warning) in warnings.iter().enumerate() {
-                        if i > 0 {
-                            list.add_space(10.0);
-                        }
-                        ui::bullet_row(list, ui::NOTICE, warning);
-                    }
-                });
+        ui::group(ui_, |g| {
+            g.add_space(12.0);
+            ui::heading(g, "Installed, but with errors", 28.0);
         });
-        if !self.webview2_missing {
-            ui_.add_space(16.0);
-            ui::paragraph(
-                ui_,
-                "Nothing here stops the launcher from running, so feel free to ignore and \
-                 gamble away.",
-                ui::text::BASE,
-                ui::tx(0.62),
-                330.0,
-            );
-        }
+        let warnings = self.warnings.clone();
+        let webview2_missing = self.webview2_missing;
+        ui::group(ui_, |g| {
+            g.add_space(20.0);
+            ui::card(g, ui::Tone::Notice, 13, |card| {
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .auto_shrink([false, true])
+                    .show(card, |list| {
+                        for (i, warning) in warnings.iter().enumerate() {
+                            if i > 0 {
+                                list.add_space(10.0);
+                            }
+                            ui::bullet_row(list, ui::NOTICE, warning);
+                        }
+                    });
+            });
+            if !webview2_missing {
+                g.add_space(16.0);
+                ui::paragraph(
+                    g,
+                    "Nothing here stops the launcher from running, so feel free to ignore and \
+                     gamble away.",
+                    ui::text::BASE,
+                    ui::tx(0.62),
+                    330.0,
+                );
+            }
+        });
 
         let mut close = false;
         let mut open_folder = false;
         let mut open_log = false;
         ui::footer(ui_, |foot| {
-            ui::action_row(foot, true, |row| {
-                close = ui::primary_button(row, "Finish").clicked();
-                row.add_space(10.0);
-                open_folder = ui::secondary_button(row, "Open folder").clicked();
-                row.with_layout(egui::Layout::left_to_right(egui::Align::Center), |row| {
-                    open_log = ui::link(row, "Open log").clicked();
-                });
+            ui::group(foot, |foot| {
+                ui::action_row_split(
+                    foot,
+                    |left| open_log = ui::link(left, "Open log").clicked(),
+                    |right| {
+                        close = ui::primary_button(right, "Finish").clicked();
+                        right.add_space(10.0);
+                        open_folder = ui::secondary_button(right, "Open folder").clicked();
+                    },
+                );
             });
         });
 
         if open_log {
-            if let Some(dir) = ui::log_dir() {
-                crate::win::open_folder(&dir);
-            }
+            ui::open_log_folder();
         } else if open_folder {
             crate::win::open_folder(&PathBuf::from(self.target_path()));
         } else if close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ui::close(ctx);
         }
     }
 
@@ -901,7 +935,6 @@ impl WizardApp {
     }
 
     fn auto_close_remaining(&self) -> Option<std::time::Duration> {
-        const AUTO_CLOSE: std::time::Duration = std::time::Duration::from_secs(4);
         if !self.warnings.is_empty() || self.stay_open {
             return None;
         }
@@ -909,79 +942,52 @@ impl WizardApp {
         Some(AUTO_CLOSE.saturating_sub(started.elapsed()))
     }
 
-    fn page_failed(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context, err: &str) {
-        ui_.add_space(12.0);
-        ui::heading(ui_, "Welp that didn't work", 26.0);
-        ui_.add_space(12.0);
-        let friendly = ui::friendly_error(err);
-        ui::paragraph(
-            ui_,
-            if friendly.is_empty() {
-                "Setup couldn't finish. Here's what went wrong:"
-            } else {
-                friendly
-            },
-            ui::text::BODY,
-            ui::tx(0.72),
-            340.0,
-        );
-        ui_.add_space(18.0);
-        ui::detail_box(ui_, ui::Tone::Danger, "Details", err);
-        ui_.add_space(10.0);
+    fn page_failed(&mut self, ui_: &mut egui::Ui, ctx: &egui::Context) {
+        let err = self.error.clone().unwrap_or_default();
+        ui::group(ui_, |g| {
+            g.add_space(12.0);
+            ui::heading(g, "Install failed", 26.0);
+        });
+        let friendly = ui::friendly_error(&err);
         let rolled_back = !err.contains(crate::install::ROLLBACK_FAILED);
-        ui_.label(
-            RichText::new(if rolled_back {
-                "Nothing was left half-installed. Setup put everything back the way it \
-                 found it."
-            } else {
-                "Setup could not put everything back. Run setup again to repair the install."
-            })
-            .size(ui::text::XS)
-            .color(ui::tx(0.56)),
-        );
-
-        let mut copy = false;
-        let mut open_log = false;
-        let mut retry = false;
-        let mut close = false;
-        ui::footer(ui_, |foot| {
-            ui::action_row(foot, true, |row| {
-                close = ui::primary_button(row, "Close").clicked();
-                row.add_space(10.0);
-                retry = ui::secondary_button(row, "Try again").clicked();
-                row.with_layout(egui::Layout::left_to_right(egui::Align::Center), |row| {
-                    copy = ui::secondary_button(row, "Copy details").clicked();
-                    row.add_space(12.0);
-                    open_log = ui::link(row, "Open log").clicked();
-                });
-            });
+        ui::group(ui_, |g| {
+            g.add_space(18.0);
+            ui::detail_box(g, ui::Tone::Danger, "Details", &err, 170.0);
+            if !friendly.is_empty() {
+                g.add_space(10.0);
+                ui::paragraph(g, friendly, ui::text::XS, ui::tx(0.62), 400.0);
+            }
+            if !rolled_back {
+                g.add_space(10.0);
+                ui::paragraph(
+                    g,
+                    "Setup could not put everything back. Run setup again to repair the install.",
+                    ui::text::XS,
+                    ui::DANGER_TEXT,
+                    400.0,
+                );
+            }
         });
 
-        if copy {
-            ctx.copy_text(err.to_string());
-        } else if open_log {
-            if let Some(dir) = ui::log_dir() {
-                crate::win::open_folder(&dir);
-            }
-        } else if retry {
-            self.retry_from_options();
-        } else if close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-    }
+        let copy_label = self.copied.label(ctx);
+        let mut actions = None;
+        ui::footer(ui_, |foot| {
+            ui::group(foot, |foot| {
+                actions = Some(ui::failure_footer(foot, copy_label, true));
+            });
+        });
+        let Some(actions) = actions else { return };
 
-    fn retry_from_options(&mut self) {
-        self.error = None;
-        self.outcome.set(crate::exit::OK);
-        self.committed = false;
-        self.cancelling = false;
-        self.cancel = Cancel::default();
-        self.warnings.clear();
-        self.target_check = None;
-        self.target_job = None;
-        self.target_stale_since = None;
-        self.closed_launcher = false;
-        self.goto(Page::Options);
+        if actions.copy {
+            ctx.copy_text(err);
+            self.copied.mark();
+        } else if actions.open_log {
+            ui::open_log_folder();
+        } else if actions.retry {
+            self.retry();
+        } else if actions.close {
+            ui::close(ctx);
+        }
     }
 }
 
@@ -1043,6 +1049,17 @@ mod tests {
             },
         );
         assert!(!install_allowed(Some(&refused), &seen.0));
+    }
+
+    #[test]
+    fn size_line_reads_needed_then_free() {
+        let line = ok_check().size_line().unwrap();
+        assert!(line.contains(" · ") && line.ends_with(" free"), "{line}");
+        let refused = TargetCheck {
+            refusal: Some("no"),
+            ..ok_check()
+        };
+        assert_eq!(refused.size_line(), None);
     }
 
     #[test]

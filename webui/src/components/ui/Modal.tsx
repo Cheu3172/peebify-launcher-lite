@@ -7,6 +7,25 @@ import { AnimatePresence, m } from "framer-motion";
 import { useEscapeKey } from "../../lib/useClickOutside";
 import { useFocusTrap } from "../../lib/useFocusTrap";
 
+const ENTER = { duration: 0.18, ease: [0.4, 0, 0.2, 1] } as const;
+const EXIT = { duration: 0.14, ease: [0.4, 0, 1, 1] } as const;
+
+// The panel's frosted glass eases in and out by its blur, tint, border and shadow rather than by opacity.
+// Fading a blurred element with opacity makes the browser draw the blur differently until the fade ends, so it
+// visibly snaps into place right after the dialog opens.
+const GLASS_ON = {
+  backgroundColor: "rgba(18, 18, 22, 0.6)",
+  backdropFilter: "blur(20px) saturate(180%)",
+  borderColor: "rgba(255, 255, 255, 0.1)",
+  boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.25)",
+};
+const GLASS_OFF = {
+  backgroundColor: "rgba(18, 18, 22, 0)",
+  backdropFilter: "blur(0px) saturate(100%)",
+  borderColor: "rgba(255, 255, 255, 0)",
+  boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0)",
+};
+
 export function Modal({
   open,
   onClose,
@@ -57,8 +76,8 @@ export function Modal({
             className="absolute inset-0 bg-black/55"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.14 }}
+            exit={{ opacity: 0, transition: EXIT }}
+            transition={ENTER}
             onMouseDown={dismissOnBackdrop ? onClose : undefined}
           />
           <m.div
@@ -68,18 +87,18 @@ export function Modal({
             aria-labelledby={labelledBy}
             aria-describedby={describedBy}
             tabIndex={-1}
-            className="glass relative max-h-[88vh] overflow-y-auto overscroll-contain rounded-ui shadow-2xl outline-none"
+            className="relative max-h-[88vh] max-w-full overflow-y-auto overscroll-contain rounded-ui border outline-none"
             style={{ width }}
-            initial={{ scale: 0.96, y: 10 }}
-            animate={{ scale: 1, y: 0 }}
-            exit={{ scale: 0.97, y: 8 }}
-            transition={{ duration: 0.18, ease: [0.4, 0, 0.2, 1] }}
+            initial={{ ...GLASS_OFF, scale: 0.96, y: 10 }}
+            animate={{ ...GLASS_ON, scale: 1, y: 0 }}
+            exit={{ ...GLASS_OFF, scale: 0.97, y: 8, transition: EXIT }}
+            transition={ENTER}
           >
             <m.div
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.18, ease: [0.4, 0, 0.2, 1] }}
+              exit={{ opacity: 0, transition: EXIT }}
+              transition={ENTER}
             >
               {children}
             </m.div>

@@ -35,14 +35,16 @@ export const qualityLabel = (q: ResourceQuality): string =>
 export function useResourceQuality(
   gameId: GameId,
   { installed, steamCopy, jobActive }: { installed: boolean; steamCopy: boolean; jobActive: boolean },
-  { sizes: withSizes = false }: { sizes?: boolean } = {},
+  { sizes: withSizes = false, initial = null }: { sizes?: boolean; initial?: ResourceQualityInfo | null } = {},
 ) {
   const game = gameById(gameId);
   const quality =
     useCustomizationStore((s) => s.resourceQuality[gameId]) ?? DEFAULT_RESOURCE_QUALITY;
   const setResourceQuality = useCustomizationStore((s) => s.setResourceQuality);
   const push = useNotificationStore((s) => s.push);
-  const [info, setInfo] = useState<{ gameId: GameId; data: ResourceQualityInfo } | null>(null);
+  const [info, setInfo] = useState<{ gameId: GameId; data: ResourceQualityInfo } | null>(
+    initial ? { gameId, data: initial } : null,
+  );
   useEffect(() => {
     if (!game.resourceQualityChoice) return;
     let alive = true;

@@ -698,7 +698,8 @@ fn owns_directory(dir: &Path, manifest: Option<&InstallManifest>) -> bool {
 
 // ------------ Uninstall Run ------------
 // respawn_for_uninstall copies setup to a temp folder and runs it from there (the second stage), because the
-// installed uninstall.exe cannot delete its own folder. perform_uninstall then does the removal step by step.
+// installed uninstall.exe cannot delete its own folder. The second stage either opens the uninstall window to let you
+// choose what to remove, or goes straight to removing. perform_uninstall then does the removal step by step.
 const UNINSTALL_RUN_PREFIX: &str = "peebify-uninstall";
 
 fn is_uninstall_run_dir(dir: &Path) -> bool {
@@ -706,7 +707,14 @@ fn is_uninstall_run_dir(dir: &Path) -> bool {
         .is_some_and(|name| name.to_string_lossy().starts_with(&format!("{UNINSTALL_RUN_PREFIX}-")))
 }
 
-pub fn respawn_for_uninstall(opts: &UninstallOptions, silent: bool) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SecondStage {
+    Choose,
+    Run,
+    Silent,
+}
+
+pub fn respawn_for_uninstall(opts: &UninstallOptions, stage: SecondStage) -> Result<(), String> {
     let current = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let run_dir =
         win::create_run_dir(UNINSTALL_RUN_PREFIX).map_err(|e| format!("stage uninstaller: {e}"))?;
@@ -717,13 +725,16 @@ pub fn respawn_for_uninstall(opts: &UninstallOptions, silent: bool) -> Result<()
     }
     let dir_arg = opts.install_dir.display().to_string();
     let mut args: Vec<&str> = vec!["/uninstall", "--second-stage", "--dir", &dir_arg];
+    if stage == SecondStage::Choose {
+        args.push("--choose");
+    }
     if opts.remove_data {
         args.push("--remove-data");
     }
     if opts.remove_games {
         args.push("--remove-games");
     }
-    if silent {
+    if stage == SecondStage::Silent {
         args.push("/S");
     }
     if let Err(e) = win::spawn_detached(&temp_copy, &args, Some(&run_dir)) {

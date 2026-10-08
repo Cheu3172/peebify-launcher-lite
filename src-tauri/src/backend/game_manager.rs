@@ -1579,6 +1579,9 @@ pub(super) fn local_game_version_for(profile: &Value, game_path: &str) -> Option
     if game_profiles::install_mode(profile) == Some("bd2") {
         return super::bd2::installed_version(Path::new(game_path));
     }
+    if game_profiles::install_mode(profile) == Some("dna") {
+        return super::dna::installed_version(Path::new(game_path)).map(|v| v.to_string());
+    }
     if game_profiles::install_mode(profile) == Some("hypergryph") {
         return super::hypergryph_reconcile::load_manifest(Path::new(game_path))
             .map(|manifest| manifest.version);
@@ -1716,6 +1719,14 @@ async fn fetch_game_config(profile: &Value, force_check: bool) -> Result<Value, 
         game_profiles::InstallMode::Bd2 => {
             let version = super::bd2::fetch_version(profile).await?;
             Ok(json!({ "version": version }))
+        }
+        game_profiles::InstallMode::Dna => {
+            let version = super::dna::fetch_version(profile).await?;
+            Ok(json!({ "version": version }))
+        }
+        game_profiles::InstallMode::Yostar => {
+            let release = super::yostar::fetch_release(profile).await?;
+            Ok(json!({ "version": release.version }))
         }
         game_profiles::InstallMode::Hypergryph => {
             let latest = super::hypergryph::get_latest_game(profile).await?;

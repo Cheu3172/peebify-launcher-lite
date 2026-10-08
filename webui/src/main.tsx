@@ -5,14 +5,16 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { Minus, X } from "lucide-react";
 import App from "./App";
-import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ErrorBoundary, retryOrReload } from "./components/ErrorBoundary";
 import { installGlobalErrorCapture } from "./lib/log";
+import { installScaleTransition } from "./lib/scaleTransition";
 import { blockContextMenu, closeWindow, minimizeWindow } from "./lib/tauri";
 import { openLogsFolder } from "./lib/ipc";
 import { useUiStore } from "./store/uiStore";
 import "./index.css";
 
 installGlobalErrorCapture("main");
+installScaleTransition();
 blockContextMenu();
 
 function crashContext(): Record<string, unknown> {
@@ -48,15 +50,9 @@ function RootCrashScreen({ onRetry }: { onRetry: () => void }) {
       <div className="flex items-center gap-2">
         <button
           className="rounded-lg bg-white/10 px-4 py-2 text-sm hover:bg-white/20"
-          onClick={onRetry}
+          onClick={() => retryOrReload(onRetry)}
         >
           Try again
-        </button>
-        <button
-          className="rounded-lg bg-white/5 px-4 py-2 text-sm text-white/80 hover:bg-white/15"
-          onClick={() => window.location.reload()}
-        >
-          Reload launcher
         </button>
         <button
           className="rounded-lg bg-white/5 px-4 py-2 text-sm text-white/80 hover:bg-white/15"

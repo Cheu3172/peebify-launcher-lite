@@ -63,7 +63,7 @@ mod registry {
             .ok()?
             .get_raw_value(APP_NAME)
             .ok()
-            .map(|value| value.bytes)
+            .map(|value| value.bytes.into_owned())
     }
 
     pub fn clear_startup_approval() -> io::Result<bool> {

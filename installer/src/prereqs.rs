@@ -392,11 +392,20 @@ mod net {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
     const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    fn agent(connect: Duration, read_idle: Duration) -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout_connect(connect)
-            .timeout_read(read_idle)
+    // ureq 3 only offers a total budget for the body, not a per-read one, so the idle limit is
+    // enforced by attempt_download itself.
+    struct Agent {
+        inner: ureq::Agent,
+        read_idle: Duration,
+    }
+
+    fn agent(connect: Duration, read_idle: Duration) -> Agent {
+        let inner = ureq::Agent::config_builder()
+            .timeout_connect(Some(connect))
+            .timeout_recv_response(Some(read_idle))
             .build()
+            .into();
+        Agent { inner, read_idle }
     }
 
     fn mb(bytes: u64) -> String {
@@ -459,30 +468,55 @@ mod net {
     }
 
     fn attempt_download(
-        agent: &ureq::Agent,
+        agent: &Agent,
         url: &str,
         dest: &Path,
         progress: &mut impl FnMut(u64, Option<u64>),
     ) -> Result<(), String> {
-        let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+        let resp = agent.inner.get(url).call().map_err(|e| e.to_string())?;
 
         let total = resp
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|n| *n > 0);
 
-        let mut reader = resp.into_reader();
+        // A blocked read cannot be interrupted, so it runs on its own thread and a chunk that takes
+        // longer than read_idle to arrive fails the attempt. The thread exits on its next read.
+        let mut reader = resp.into_body().into_reader();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(4);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; BUF_BYTES];
+            loop {
+                let chunk = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => Ok(buf[..n].to_vec()),
+                    Err(e) => Err(e),
+                };
+                let failed = chunk.is_err();
+                if tx.send(chunk).is_err() || failed {
+                    break;
+                }
+            }
+        });
+
         let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
-        let mut buf = vec![0u8; BUF_BYTES];
         let mut done: u64 = 0;
         progress(0, total);
         loop {
-            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-            done += n as u64;
+            let chunk = match rx.recv_timeout(agent.read_idle) {
+                Ok(chunk) => chunk.map_err(|e| e.to_string())?,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "download stalled: no data for {} ms",
+                        agent.read_idle.as_millis()
+                    ))
+                }
+            };
+            out.write_all(&chunk).map_err(|e| e.to_string())?;
+            done += chunk.len() as u64;
             progress(done, total);
         }
         out.flush().map_err(|e| e.to_string())?;

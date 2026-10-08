@@ -9,19 +9,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use md5::{Digest, Md5};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
 
+use super::fs_util::ContentHasher;
 use super::game_profiles::InstallMode;
 use super::queue::{Phase, Update};
 use super::state::BackendState;
 use super::validator::{self, Resource, ValidationMeta};
 use super::{
-    bd2, bluepoch, err_response, game_path, game_profiles, gf2, http, hypergryph,
-    hypergryph_reconcile as reconcile, nte, ok_with, progress, sophon,
+    bd2, bluepoch, dna, err_response, game_path, game_profiles, gf2, http, hypergryph,
+    hypergryph_reconcile as reconcile, nte, ok_with, progress, sophon, yostar,
 };
 
 pub mod status {
@@ -73,6 +73,17 @@ pub fn combine_url(base: &str, part: &str) -> String {
     let base = base.strip_suffix('/').unwrap_or(base);
     let part = part.strip_prefix('/').unwrap_or(part);
     format!("{base}/{part}")
+}
+
+pub(super) fn remote_path(mode: InstallMode, dest: &str) -> std::borrow::Cow<'_, str> {
+    match mode {
+        InstallMode::Yostar => std::borrow::Cow::Owned(yostar::encode_path(dest)),
+        _ => std::borrow::Cow::Borrowed(dest),
+    }
+}
+
+pub(super) fn prunes_removed(mode: InstallMode) -> bool {
+    matches!(mode, InstallMode::Default | InstallMode::Yostar)
 }
 
 // ------------ Resume Files ------------
@@ -278,8 +289,8 @@ fn md5_mismatch(path: &Path, expected_size: u64, expected_md5: &str) -> Result<O
     if len != expected_size {
         return Ok(Some(format!("{len} bytes instead of {expected_size}")));
     }
-    let got = super::fs_util::md5_file(path, &mut || false, &mut |_| {})?;
-    Ok((!got.eq_ignore_ascii_case(expected_md5)).then_some(got))
+    let got = super::fs_util::checksum_file(path, expected_md5, &mut || false, &mut |_| {})?;
+    Ok((!super::fs_util::checksum_matches(expected_md5, &got)).then_some(got))
 }
 
 fn log_checksum_mismatch(file_id: &str, url: &str, expected_md5: &str, got: &str, bytes: u64) {
@@ -1039,12 +1050,20 @@ impl GameDownloadManager {
         self.mode() == InstallMode::Bd2
     }
 
+    fn is_dna(&self) -> bool {
+        self.mode() == InstallMode::Dna
+    }
+
+    fn is_yostar(&self) -> bool {
+        self.mode() == InstallMode::Yostar
+    }
+
     fn uses_split_archives(&self) -> bool {
         splits_archives(self.mode())
     }
 
     fn prunes_removed_resources(&self) -> bool {
-        self.mode() == InstallMode::Default
+        prunes_removed(self.mode())
     }
 
     fn is_cancelled(&self) -> bool {
@@ -1271,6 +1290,11 @@ impl GameDownloadManager {
         if self.is_bd2() {
             prepare_install_dir(install_path, &self.profile_id())?;
             return self.bd2_install(install_path).await;
+        }
+
+        if self.is_dna() {
+            prepare_install_dir(install_path, &self.profile_id())?;
+            return self.dna_install(install_path).await;
         }
 
         self.send_progress(Phase::Scanning, status::FETCHING_CONFIG, json!({}));
@@ -1542,6 +1566,10 @@ impl GameDownloadManager {
                 config.resources.len()
             );
             return Ok(config);
+        }
+
+        if self.is_yostar() {
+            return yostar::resolve_config(profile).await;
         }
 
         if self.is_gf2() {
@@ -2008,9 +2036,10 @@ impl GameDownloadManager {
         if let Some(url) = resource.url() {
             return url.to_string();
         }
+        let remote = remote_path(self.mode(), dest);
         match self.mirrors.lock().active.as_deref() {
-            Some(active) => combine_url(active, dest),
-            None => combine_url(base_url, dest),
+            Some(active) => combine_url(active, &remote),
+            None => combine_url(base_url, &remote),
         }
     }
 
@@ -2247,7 +2276,8 @@ impl GameDownloadManager {
             return Err(format!("HTTP Error: {status} for URL {url}"));
         };
         let mut file = tokio::io::BufWriter::with_capacity(super::perf::WRITE_BUFFER_BYTES, sink);
-        let mut hasher = (resume_from == 0 && !expected_md5.is_empty()).then(Md5::new);
+        let mut hasher = (resume_from == 0 && !expected_md5.is_empty())
+            .then(|| ContentHasher::for_expected(expected_md5));
 
         self.tracker
             .set_file_progress_absolute(file_id, resume_from as f64);
@@ -2318,8 +2348,8 @@ impl GameDownloadManager {
 
         let verified_inline = match hasher {
             Some(h) => {
-                let got = hex::encode(h.finalize());
-                if !got.eq_ignore_ascii_case(expected_md5) {
+                let got = h.finish();
+                if !super::fs_util::checksum_matches(expected_md5, &got) {
                     drop(sink);
                     let bytes = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
                     log_checksum_mismatch(file_id, url, expected_md5, &got, bytes);
@@ -3791,6 +3821,192 @@ impl GameDownloadManager {
         })))
     }
 
+    async fn dna_install(self: &Arc<Self>, install_path: &Path) -> Result<Value, String> {
+        let profile = self.profile();
+        let name = game_profiles::display_name(profile);
+        let hpatchz = super::fs_util::resource(&self.app, dna::HPATCHZ).ok_or_else(|| {
+            format!(
+                "{name} is unpacked with {}, which is missing from Peebify's install. Reinstall Peebify to restore it.",
+                dna::HPATCHZ
+            )
+        })?;
+
+        self.send_progress(Phase::Scanning, status::FETCHING_CONFIG, json!({}));
+        let installed = dna::installed_version(install_path);
+        let (_, package) = dna::fetch_package(profile, installed, false).await?;
+        let version = package.version.to_string();
+        *self.current_patch_version.lock() = Some(version.clone());
+
+        log::info!(
+            "{name} {} archive for build {version} — {:.2}GB to download, {:.2}GB installed.",
+            if package.full { "full" } else { "diff" },
+            progress::gib(package.download_bytes as f64),
+            progress::gib(package.install_bytes as f64),
+        );
+
+        let patch_dir = install_path.join(dna::PATCH_DIR);
+        std::fs::create_dir_all(&patch_dir)
+            .map_err(|e| super::fs_util::fmt_io("Could not create the download folder", &e))?;
+        let archive = super::fs_util::safe_join(&patch_dir, &package.file_name)?;
+        let verified_marker = super::fs_util::safe_join(&patch_dir, &format!("{}.verified", package.file_name))?;
+        remove_other_dna_archives(&patch_dir, &package.file_name);
+
+        let complete = std::fs::metadata(&archive).is_ok_and(|m| m.len() == package.download_bytes);
+        let existing_game_bytes = super::mods::directory_size(install_path)
+            .saturating_sub(super::mods::directory_size(&patch_dir));
+        let fetch_bytes = if complete { 0 } else { package.download_bytes };
+        let write_bytes = if package.full {
+            package.install_bytes.saturating_sub(existing_game_bytes)
+        } else {
+            // A diff is applied into a sibling copy of the game folder, then swapped in.
+            package.install_bytes
+        };
+        ensure_disk_space(install_path, fetch_bytes + write_bytes, 1.0, HEADROOM_INSTALL)?;
+
+        if complete {
+            log::info!("{name}: {} is already complete on disk, so it is not downloaded again.", package.file_name);
+        } else {
+            let _ = std::fs::remove_file(&verified_marker);
+            let folders: Vec<String> = package
+                .urls
+                .iter()
+                .filter_map(|url| url.strip_suffix(&format!("/{}", package.file_name)))
+                .map(str::to_string)
+                .collect();
+            let base = folders.first().cloned().ok_or("no download mirror for the archive")?;
+            self.mirrors.lock().bases = folders;
+
+            self.tracker.reset();
+            self.tracker.set_totals(package.download_bytes as f64, 1);
+            self.tracker.set_file_sizes(HashMap::from([(
+                package.file_name.clone(),
+                package.download_bytes as f64,
+            )]));
+            let resource = Resource::new(package.file_name.clone(), package.download_bytes, "");
+            self.execute_download(vec![resource], &base, &patch_dir).await?;
+            if self.is_cancelled() {
+                return Err("Download was cancelled by the user.".to_string());
+            }
+        }
+        discard_part(&archive);
+
+        self.check_dna_archive(&archive, &verified_marker, &package).await?;
+
+        let total_bytes = package.install_bytes as f64;
+        let extraction = Arc::new(Mutex::new(ExtractionProgress::new(1, HashMap::new())));
+        let _extracting = self.begin_extracting();
+        self.note_install_write();
+        self.tracker.begin("extracting", total_bytes, 1, None);
+        let label = format!("Installing {name}...");
+        self.emit_extraction_progress(&extraction, &archive, 0.0, total_bytes, &label);
+
+        clear_dna_patch_leftovers(install_path);
+        let watching = Arc::new(AtomicBool::new(true));
+        let watcher = {
+            let watching = Arc::clone(&watching);
+            let engine = Arc::clone(self);
+            let extraction = Arc::clone(&extraction);
+            let archive = archive.clone();
+            let install = install_path.to_path_buf();
+            let patch_dir = patch_dir.clone();
+            let label = label.clone();
+            let full = package.full;
+            let baseline = if full { existing_game_bytes } else { 0 };
+            tauri::async_runtime::spawn(async move {
+                while watching.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let (install, patch_dir) = (install.clone(), patch_dir.clone());
+                    let written = tauri::async_runtime::spawn_blocking(move || {
+                        dna_bytes_written(&install, &patch_dir, full).saturating_sub(baseline)
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if total_bytes > 0.0 && watching.load(Ordering::Relaxed) {
+                        let percent = (written as f64 / total_bytes * 100.0).min(99.0);
+                        engine.emit_extraction_progress(&extraction, &archive, percent, total_bytes, &label);
+                    }
+                }
+            })
+        };
+
+        let old_dir = (!package.full).then_some(install_path);
+        let patched = self
+            .gate
+            .cancellable(run_hpatchz(&hpatchz, old_dir, &archive, install_path))
+            .await
+            .map_err(|e| self.cancel_aware(e));
+        watching.store(false, Ordering::Relaxed);
+        watcher.abort();
+        if patched.is_err() {
+            clear_dna_patch_leftovers(install_path);
+        }
+        patched?;
+        self.emit_extraction_progress(&extraction, &archive, 100.0, total_bytes, &label);
+
+        dna::write_installed_version(install_path, package.version)?;
+        match std::fs::remove_dir_all(&patch_dir) {
+            Ok(()) => log::info!("{name}: removed {} now that it is installed.", package.file_name),
+            Err(e) => log::warn!(
+                "{name}: could not remove {} after installing ({e}); it is safe to delete by hand.",
+                patch_dir.display()
+            ),
+        }
+
+        update_game_config_file(install_path, &version)?;
+        self.finish_completion(install_path).await;
+        Ok(ok_with(json!({
+            "installPath": install_path.to_string_lossy(),
+            "version": version,
+        })))
+    }
+
+    /// Hashes the 30 GB archive with progress and cancel, once. A pass is remembered next to it, so a retry after a failed
+    /// patch does not hash it again. A mismatch deletes the archive so the next attempt downloads it fresh.
+    async fn check_dna_archive(
+        self: &Arc<Self>,
+        archive: &Path,
+        verified_marker: &Path,
+        package: &dna::Package,
+    ) -> Result<(), String> {
+        let name = game_profiles::display_name(self.profile());
+        if std::fs::read_to_string(verified_marker).is_ok_and(|md5| md5.trim() == package.md5) {
+            return Ok(());
+        }
+        let total = package.download_bytes as f64;
+        let extraction = Arc::new(Mutex::new(ExtractionProgress::new(1, HashMap::new())));
+        self.tracker.begin("extracting", total, 1, None);
+        let label = format!("Checking the {name} download...");
+        self.emit_extraction_progress(&extraction, archive, 0.0, total, &label);
+
+        let path = archive.to_path_buf();
+        let cancel = Arc::clone(self.gate.flag());
+        let engine = Arc::clone(self);
+        let progress_archive = archive.to_path_buf();
+        let progress_label = label.clone();
+        let got = tauri::async_runtime::spawn_blocking(move || {
+            let mut read = 0u64;
+            super::fs_util::md5_file(&path, &mut || cancel.load(Ordering::Relaxed), &mut |n| {
+                read += n;
+                let percent = if total > 0.0 { read as f64 / total * 100.0 } else { 0.0 };
+                engine.emit_extraction_progress(&extraction, &progress_archive, percent.min(99.9), total, &progress_label);
+            })
+        })
+        .await
+        .map_err(|e| format!("{name} checksum task panicked: {e}"))?
+        .map_err(|e| self.cancel_aware(e))?;
+
+        if !super::fs_util::checksum_matches(&package.md5, &got) {
+            let _ = std::fs::remove_file(archive);
+            return Err(format!(
+                "The {name} download did not match its checksum, so it was deleted. Start the download again to fetch a fresh copy."
+            ));
+        }
+        if let Err(e) = super::fs_util::write_atomic(verified_marker, package.md5.as_bytes()) {
+            log::warn!("{name}: could not remember the checked archive ({e}).");
+        }
+        Ok(())
+    }
+
     fn handle_download_error(&self, error: &str) -> Value {
         let cancelled = self.is_cancelled();
         if cancelled {
@@ -4076,6 +4292,114 @@ pub async fn run_7z_extract(
         ));
     }
     Ok(())
+}
+
+/// Deletes archives a previous build left in the download folder, so an interrupted older download cannot fill the disk.
+fn remove_other_dna_archives(patch_dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(patch_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stem = name
+            .strip_suffix(".verified")
+            .or_else(|| PART_ARTIFACT_SUFFIXES.iter().find_map(|suffix| name.strip_suffix(suffix)))
+            .unwrap_or(&name);
+        if stem.ends_with(".hdiff") && stem != keep {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => log::info!("Removed {name}, left by an older Duet Night Abyss download."),
+                Err(e) => log::warn!("Could not remove the old download {name} ({e})."),
+            }
+        }
+    }
+}
+
+/// hpatchz patches a folder in place by building `<folder>NNN.tmp` beside it and swapping it in. An interrupted run leaves that copy behind.
+fn dna_patch_temp_dirs(install_path: &Path) -> Vec<PathBuf> {
+    let (Some(parent), Some(folder)) = (install_path.parent(), install_path.file_name()) else {
+        return Vec::new();
+    };
+    let folder = folder.to_string_lossy().into_owned();
+    let Ok(entries) = std::fs::read_dir(parent) else { return Vec::new() };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&folder)
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .is_some_and(|digits| digits.len() == 3 && digits.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn clear_dna_patch_leftovers(install_path: &Path) {
+    for dir in dna_patch_temp_dirs(install_path) {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => log::info!("Removed {}, left by an interrupted Duet Night Abyss patch.", dir.display()),
+            Err(e) => log::warn!("Could not remove {} ({e}).", dir.display()),
+        }
+    }
+}
+
+/// How much of the new build hpatchz has written: the game folder for a full archive, the sibling copy for a diff.
+fn dna_bytes_written(install_path: &Path, patch_dir: &Path, full: bool) -> u64 {
+    if full {
+        super::mods::directory_size(install_path).saturating_sub(super::mods::directory_size(patch_dir))
+    } else {
+        dna_patch_temp_dirs(install_path)
+            .iter()
+            .map(|dir| super::mods::directory_size(dir))
+            .sum()
+    }
+}
+
+/// Runs hpatchz: `-f "" archive game` unpacks a full archive, `-f game archive game` patches the game folder in place.
+pub async fn run_hpatchz(
+    hpatchz: &Path,
+    old_dir: Option<&Path>,
+    archive: &Path,
+    install_path: &Path,
+) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new(hpatchz);
+    cmd.arg("-f");
+    match old_dir {
+        Some(old) => cmd.arg(old),
+        None => cmd.arg(""),
+    };
+    cmd.arg(archive)
+        .arg(install_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    cmd.creation_flags(0x0800_0000);
+
+    let output = cmd
+        .spawn()
+        .map_err(|e| format!("hpatchz spawn failed: {e}"))?
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("hpatchz wait failed: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let detail: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let tail = detail[detail.len().saturating_sub(4)..].join(" | ");
+    Err(format!(
+        "hpatchz exited with code {} while installing from {}: {}",
+        output.status.code().unwrap_or(-1),
+        archive.display(),
+        if tail.is_empty() { "no output" } else { &tail }
+    ))
 }
 
 fn seven_zip_exit_meaning(code: i32) -> &'static str {

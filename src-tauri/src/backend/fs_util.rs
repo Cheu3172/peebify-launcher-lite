@@ -562,14 +562,59 @@ pub fn md5_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+pub const CRC64_PREFIX: &str = "crc64:";
+static CRC64_XZ: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_XZ);
+
+pub enum ContentHasher {
+    Md5(Md5),
+    Crc64(crc::Digest<'static, u64>),
+}
+
+impl ContentHasher {
+    pub fn for_expected(expected: &str) -> Self {
+        if expected.starts_with(CRC64_PREFIX) {
+            Self::Crc64(CRC64_XZ.digest())
+        } else {
+            Self::Md5(Md5::new())
+        }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Md5(hasher) => hasher.update(bytes),
+            Self::Crc64(digest) => digest.update(bytes),
+        }
+    }
+
+    pub fn finish(self) -> String {
+        match self {
+            Self::Md5(hasher) => hex::encode(hasher.finalize()),
+            Self::Crc64(digest) => format!("{CRC64_PREFIX}{}", digest.finalize()),
+        }
+    }
+}
+
+pub fn checksum_matches(expected: &str, got: &str) -> bool {
+    got.eq_ignore_ascii_case(expected)
+}
+
 pub fn md5_file(
     path: &Path,
     should_cancel: &mut dyn FnMut() -> bool,
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<String, String> {
+    checksum_file(path, "", should_cancel, on_progress)
+}
+
+pub fn checksum_file(
+    path: &Path,
+    expected: &str,
+    should_cancel: &mut dyn FnMut() -> bool,
+    on_progress: &mut dyn FnMut(u64),
+) -> Result<String, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| super::fs_util::fmt_io(&format!("Could not read {}", path.display()), &e))?;
-    let mut hasher = Md5::new();
+    let mut hasher = ContentHasher::for_expected(expected);
     let mut hash_with = |buf: &mut [u8]| -> Result<(), String> {
         loop {
             if should_cancel() {
@@ -594,7 +639,7 @@ pub fn md5_file(
         }
         Err(_) => hash_with(&mut vec![0u8; STREAM_CHUNK_SIZE]),
     })?;
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hasher.finish())
 }
 
 pub fn sanitize_folder_name(name: &str) -> String {
@@ -1036,6 +1081,40 @@ mod tests {
         assert!(!denied);
         assert_eq!(leftovers, 0);
         assert!(!missing_denied);
+    }
+
+    #[test]
+    fn a_crc64_expectation_hashes_with_crc64_xz_in_decimal() {
+        let mut hasher = ContentHasher::for_expected("crc64:0");
+        hasher.update(b"1234");
+        hasher.update(b"56789");
+        assert_eq!(hasher.finish(), "crc64:11051210869376104954");
+    }
+
+    #[test]
+    fn an_empty_crc64_input_hashes_to_zero() {
+        assert_eq!(ContentHasher::for_expected("crc64:0").finish(), "crc64:0");
+    }
+
+    #[test]
+    fn a_plain_expectation_still_hashes_with_md5() {
+        let mut hasher = ContentHasher::for_expected("900150983cd24fb0d6963f7d28e17f72");
+        hasher.update(b"abc");
+        let got = hasher.finish();
+        assert!(checksum_matches("900150983CD24FB0D6963F7D28E17F72", &got));
+    }
+
+    #[test]
+    fn checksum_file_follows_the_expected_algorithm() {
+        let dir = scratch("checksum");
+        let path = dir.join("digits.bin");
+        std::fs::write(&path, b"123456789").unwrap();
+        let crc = checksum_file(&path, "crc64:1", &mut || false, &mut |_| {}).unwrap();
+        let md5 = checksum_file(&path, "", &mut || false, &mut |_| {}).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(crc, "crc64:11051210869376104954");
+        assert_eq!(md5, "25f9e794323b453885f5181f1b624d0b");
     }
 
     #[test]

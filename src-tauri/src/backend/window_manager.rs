@@ -2,7 +2,7 @@
 // Looks after the main window and the tray icon: showing, hiding and minimizing, remembering size and position,
 // and deciding when it is safe to quit.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -31,6 +31,12 @@ pub(crate) const WEBVIEW_BROWSER_ARGS: &str =
 const FIRST_PAINT_NUDGE_HOLD: std::time::Duration = std::time::Duration::from_millis(32);
 const FIRST_PAINT_SETTLE: std::time::Duration = std::time::Duration::from_millis(48);
 const RECORDING_FINALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Changing the Interface size eases the window and its contents to the new size instead of snapping.
+const SCALE_ANIMATION: std::time::Duration = std::time::Duration::from_millis(240);
+const SCALE_PIN: std::time::Duration = std::time::Duration::from_millis(40);
+const SCALE_SETTLE: std::time::Duration = std::time::Duration::from_millis(60);
+const SCALE_TAIL: std::time::Duration = std::time::Duration::from_millis(40);
+const SCALE_FADE: std::time::Duration = std::time::Duration::from_millis(110);
 const QUIT_WHEN_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 const KEEP_IN_TRAY_LABEL: &str = "Keep running in tray";
 const QUIT_ANYWAY_LABEL: &str = "Quit anyway";
@@ -58,6 +64,8 @@ pub struct WindowManager {
     is_quitting: AtomicBool,
     save_generation: AtomicU64,
     zoom_generation: AtomicU64,
+    zoom_animations: AtomicUsize,
+    zoom_gate: tauri::async_runtime::Mutex<()>,
     ui_zoom: AtomicU64,
     ready_shown: AtomicBool,
     was_minimized: AtomicBool,
@@ -80,6 +88,8 @@ impl WindowManager {
             is_quitting: AtomicBool::new(false),
             save_generation: AtomicU64::new(0),
             zoom_generation: AtomicU64::new(0),
+            zoom_animations: AtomicUsize::new(0),
+            zoom_gate: tauri::async_runtime::Mutex::new(()),
             ui_zoom: AtomicU64::new(1.0f64.to_bits()),
             ready_shown: AtomicBool::new(false),
             was_minimized: AtomicBool::new(false),
@@ -734,8 +744,104 @@ impl WindowManager {
         parse_ui_scale(&self.behavior("uiScale"))
     }
 
-    pub fn apply_ui_scale(&self) {
-        self.rezoom_for_current_monitor();
+    pub fn apply_ui_scale(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            // One animation at a time. A change made mid-animation waits its turn and then animates from where
+            // the last one ended to whatever the setting is by then.
+            let _turn = me.zoom_gate.lock().await;
+            me.animate_rezoom().await;
+        });
+    }
+
+    // Animates an Interface size change without ever re-laying out the page mid-way and without moving the window
+    // while it plays (both made text re-wrap, blur and clip). The steps:
+    //   pin   - the page freezes its layout at its current size, anchored to the top-left corner
+    //   grow  - the transparent window jumps to the larger of the old and new size (spare room is invisible)
+    //   start - the page scales the card to the new size on its own clock (crisp text, no IPC lag)
+    //   swap  - window size and real zoom are applied together in one call; the page lets go of the card in the
+    //           frame the new zoom actually shows up, when the natural layout is exactly where the card ended
+    async fn animate_rezoom(&self) {
+        let Some(win) = main_window(&self.app) else {
+            return;
+        };
+        if win.is_minimized().unwrap_or(false) || win.is_fullscreen().unwrap_or(false) {
+            return;
+        }
+        let Ok(Some(monitor)) = win.current_monitor() else {
+            return;
+        };
+        let (area, scale) = work_area_of(&monitor);
+        let to = interface_zoom(area, scale, self.user_ui_scale());
+        let from = self.ui_zoom();
+        if to == from {
+            return;
+        }
+
+        struct Running<'a>(&'a AtomicUsize);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        self.zoom_animations.fetch_add(1, Ordering::SeqCst);
+        let _running = Running(&self.zoom_animations);
+
+        // A maximized window can't grow, so the layout has to change; dip to dark around the swap instead.
+        if win.is_maximized().unwrap_or(false) {
+            self.emit_scale_phase("fade-out", 1.0);
+            tokio::time::sleep(SCALE_FADE).await;
+            self.set_ui_zoom(&win, to);
+            tokio::time::sleep(SCALE_SETTLE).await;
+            self.emit_scale_phase("fade-in", 1.0);
+            return;
+        }
+
+        let (Ok(position), Ok(size)) = (win.outer_position(), win.outer_size()) else {
+            self.set_ui_zoom(&win, to);
+            return;
+        };
+        let start = Bounds {
+            x: f64::from(position.x),
+            y: f64::from(position.y),
+            w: f64::from(size.width),
+            h: f64::from(size.height),
+        };
+        let ratio = to / from;
+        // Grow and shrink from the right and bottom edges, keeping the top-left corner put. Moving the corner would
+        // make Windows show the previous frame at the new position for a moment, which reads as a jump.
+        let end = Bounds { w: start.w * ratio, h: start.h * ratio, ..start };
+        // Both rectangles share a corner, so the bigger one contains the other.
+        let stage = if ratio > 1.0 { end } else { start };
+
+        let (min_w, min_h) = MIN_WINDOW_LOGICAL;
+        let lower = from.min(to);
+        let _ = win.set_min_size(Some(tauri::LogicalSize::new(min_w * lower, min_h * lower)));
+
+        self.emit_scale_phase("pin", ratio);
+        tokio::time::sleep(SCALE_PIN).await;
+        if stage != start {
+            set_window_bounds(&win, stage);
+        }
+        tokio::time::sleep(SCALE_SETTLE).await;
+        self.emit_scale_phase("start", ratio);
+        tokio::time::sleep(SCALE_ANIMATION + SCALE_TAIL).await;
+
+        apply_scale_swap(&win, to, end);
+        let (min_w, min_h) = MIN_WINDOW_LOGICAL;
+        let _ = win.set_min_size(Some(tauri::LogicalSize::new(min_w * to, min_h * to)));
+        self.ui_zoom.store(to.to_bits(), Ordering::SeqCst);
+        log::info!("display: interface zoom {from} -> {to}");
+        self.emit_scale_phase("end", ratio);
+        fit_to_work_area(&win, to);
+    }
+
+    fn emit_scale_phase(&self, phase: &str, ratio: f64) {
+        let _ = self.app.emit_to(
+            MAIN_WINDOW_LABEL,
+            "ui-scale-transition",
+            json!({ "phase": phase, "ratio": ratio, "ms": SCALE_ANIMATION.as_millis() as u64 }),
+        );
     }
 
     fn set_ui_zoom(&self, win: &WebviewWindow, zoom: f64) {
@@ -752,6 +858,11 @@ impl WindowManager {
     }
 
     pub fn schedule_zoom_check(self: &Arc<Self>) {
+        // The scale animation moves the window every frame; those moves aren't the user dragging it to another
+        // monitor, and treating them as such would cancel the animation and snap to the end.
+        if self.zoom_animations.load(Ordering::SeqCst) > 0 {
+            return;
+        }
         let generation = self.zoom_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let me = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
@@ -1337,6 +1448,49 @@ fn fitted_into(window: Bounds, area: Bounds, scale: f64, zoom: f64) -> Option<Bo
         .min((area.h * WORK_AREA_FILL).floor())
         .max((min_h * scale).min(area.h));
     Some(Bounds { w, h, ..window }.centered_in(area))
+}
+
+// Moves and resizes the window in one SetWindowPos, so growing around the centre never shows a frame where the
+// size changed but the position hasn't caught up.
+fn set_window_bounds(win: &WebviewWindow, b: Bounds) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    let Ok(hwnd) = win.hwnd() else {
+        return;
+    };
+    unsafe {
+        SetWindowPos(
+            hwnd.0 as windows_sys::Win32::Foundation::HWND,
+            std::ptr::null_mut(),
+            b.x.round() as i32,
+            b.y.round() as i32,
+            b.w.round() as i32,
+            b.h.round() as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+// The last step of the scale animation: the final window rectangle and the real zoom, applied in the same call on
+// the UI thread so the page sees both change together.
+fn apply_scale_swap(win: &WebviewWindow, zoom: f64, b: Bounds) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+
+    let hwnd = win.hwnd().ok().map(|h| h.0 as isize);
+    let _ = win.with_webview(move |webview| unsafe {
+        if let Some(hwnd) = hwnd {
+            SetWindowPos(
+                hwnd as windows_sys::Win32::Foundation::HWND,
+                std::ptr::null_mut(),
+                b.x.round() as i32,
+                b.y.round() as i32,
+                b.w.round() as i32,
+                b.h.round() as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        let _ = webview.controller().SetZoomFactor(zoom);
+    });
 }
 
 fn fit_to_work_area(win: &WebviewWindow, zoom: f64) {

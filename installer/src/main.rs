@@ -37,6 +37,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "silent",
     "uninstall",
     "second-stage",
+    "choose",
     "remove-data",
     "remove-games",
     "no-desktop-shortcut",
@@ -263,13 +264,7 @@ fn gui_main() -> i32 {
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
             match dir {
                 Some(dir) if dir.join(consts::INSTALL_MANIFEST_NAME).exists() => {
-                    match ui::uninstall::run(dir.clone()) {
-                        Ok(()) => exit::OK,
-                        Err(e) => {
-                            ilog!("uninstall: the window could not open ({e})");
-                            uninstall_without_window(dir)
-                        }
-                    }
+                    open_uninstaller(dir)
                 }
                 _ => {
                     win::message_box_error(
@@ -387,7 +382,7 @@ fn uninstall_without_window(install_dir: PathBuf) -> i32 {
         remove_data: false,
         remove_games: false,
     };
-    match install::respawn_for_uninstall(&opts, false) {
+    match install::respawn_for_uninstall(&opts, install::SecondStage::Run) {
         Ok(()) => exit::OK,
         Err(e) => {
             ilog!("uninstall respawn failed: {e}");
@@ -433,20 +428,12 @@ fn uninstall_main(args: &[String]) -> i32 {
                 "uninstall",
             )
         } else {
-            let work: msg::EngineWork =
-                Box::new(move |sink| install::perform_uninstall(&opts, sink));
-            match ui::splash::run(ui::splash::SplashSpec::uninstall(), work) {
-                Ok(code) => code,
-                Err(e) => {
-                    win::message_box_error("Peebify Launcher", &format!("UI error: {e}"));
-                    exit::FAILED
-                }
-            }
+            staged_uninstall(opts, flag(args, "choose"))
         };
         install::schedule_self_delete();
         code
     } else if silent {
-        match install::respawn_for_uninstall(&opts, true) {
+        match install::respawn_for_uninstall(&opts, install::SecondStage::Silent) {
             Ok(()) => exit::OK,
             Err(e) => {
                 ilog!("uninstall respawn failed: {e}");
@@ -454,12 +441,61 @@ fn uninstall_main(args: &[String]) -> i32 {
             }
         }
     } else {
-        match ui::uninstall::run(opts.install_dir.clone()) {
-            Ok(()) => exit::OK,
-            Err(e) => {
-                ilog!("uninstall: the window could not open ({e})");
-                uninstall_without_window(opts.install_dir)
+        open_uninstaller(opts.install_dir)
+    }
+}
+
+fn open_uninstaller(install_dir: PathBuf) -> i32 {
+    let opts = UninstallOptions {
+        install_dir: install_dir.clone(),
+        remove_data: false,
+        remove_games: false,
+    };
+    match install::respawn_for_uninstall(&opts, install::SecondStage::Choose) {
+        Ok(()) => return exit::OK,
+        Err(e) => ilog!("uninstall: could not stage the uninstaller ({e}), choosing in place"),
+    }
+    let launch = ui::uninstall::Launch {
+        install_dir: install_dir.clone(),
+        staged: false,
+        start: ui::uninstall::Start::Choose,
+    };
+    match ui::uninstall::run(launch) {
+        Ok(code) => code,
+        Err(e) => {
+            ilog!("uninstall: the window could not open ({e})");
+            uninstall_without_window(install_dir)
+        }
+    }
+}
+
+fn staged_uninstall(opts: UninstallOptions, choose: bool) -> i32 {
+    let launch = ui::uninstall::Launch {
+        install_dir: opts.install_dir.clone(),
+        staged: true,
+        start: if choose {
+            ui::uninstall::Start::Choose
+        } else {
+            ui::uninstall::Start::Remove(opts.clone())
+        },
+    };
+    match ui::uninstall::run(launch) {
+        Ok(code) => code,
+        Err(e) => {
+            ilog!("uninstall: the window could not open ({e}), running without it");
+            let confirmed = !choose
+                || win::message_box_yes_no(
+                    consts::PRODUCT_NAME,
+                    "Setup's window couldn't open on this PC. Remove Peebify Launcher anyway? \
+                     Your settings and installed games are kept.",
+                );
+            if !confirmed {
+                return exit::CANCELLED;
             }
+            engine_exit_code(
+                install::perform_uninstall(&opts, &msg::log_sink()),
+                "uninstall",
+            )
         }
     }
 }

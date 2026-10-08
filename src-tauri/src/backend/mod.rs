@@ -5,6 +5,7 @@
 pub(crate) mod api_config;
 pub(crate) mod bd2;
 pub(crate) mod bluepoch;
+pub(crate) mod dna;
 pub(crate) mod capture;
 pub(crate) mod config;
 pub(crate) mod config_channels;
@@ -30,6 +31,7 @@ pub(crate) mod mod_ini;
 pub(crate) mod mod_profiles;
 pub(crate) mod mods;
 mod news;
+pub(crate) mod nexon_forum;
 pub mod notify;
 pub(crate) mod nte;
 pub(crate) mod overlay;
@@ -51,6 +53,7 @@ pub(crate) mod win_startup;
 pub(crate) mod window_manager;
 pub(crate) mod xxmi;
 pub(crate) mod xxmi_update;
+pub(crate) mod yostar;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};

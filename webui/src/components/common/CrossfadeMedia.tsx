@@ -53,9 +53,14 @@ export function CrossfadeMedia({
         return () => {
           videoRefs.current.delete(id);
           videoRefCallbacks.current.delete(id);
-          el.pause();
-          el.removeAttribute("src");
-          el.load();
+          // Free the video's memory only if it really left the page. In development, React's Strict Mode runs this
+          // cleanup on a simulated unmount and keeps the same element, which would otherwise be left blank.
+          queueMicrotask(() => {
+            if (el.isConnected) return;
+            el.pause();
+            el.removeAttribute("src");
+            el.load();
+          });
         };
       };
       videoRefCallbacks.current.set(id, cb);

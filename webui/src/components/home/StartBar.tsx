@@ -1,6 +1,7 @@
 // ------------ Start Bar ------------
 // The big button on the Home screen. Depending on the game it reads Install, Update, Play or Running, and while
 // a download is going it turns into progress with pause and cancel.
+import { useEffect, useLayoutEffect, useState } from "react";
 import { AnimatePresence, m, type Variants } from "framer-motion";
 import { Play, Download, Pause, X, ChevronsUp, Loader2 } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
@@ -30,6 +31,7 @@ import {
   type QueueJob,
 } from "../../lib/ipc";
 import { requestCancelJob } from "../../lib/cancelJob";
+import { warmInstall } from "../../lib/installPreload";
 import { fadeVariants } from "../../lib/motion";
 import {
   isActiveJob,
@@ -139,6 +141,22 @@ export function StartBar({ hidePlaytime = false }: { hidePlaytime?: boolean }) {
   const cancelTip = useAnchoredTip<HTMLButtonElement>("bottom");
   const game = gameById(activeId);
   const openInstall = useModalStore((s) => s.openInstall);
+  const dialogOpen = useModalStore((s) => s.modal !== null);
+  // Clicking the button leaves it hovered (lifted, with a bigger shadow). When a dialog then opens over it, the
+  // hover ends and the button would sink back while the dimming fades in on top, which reads as a flicker under
+  // the overlay. Keep it lifted until the dialog closes; it settles back afterwards with nothing on top of it.
+  const [heldRaised, setHeldRaised] = useState(false);
+  useLayoutEffect(() => {
+    if (dialogOpen) {
+      if (tip.anchorRef.current?.matches(":hover")) setHeldRaised(true);
+    } else {
+      setHeldRaised(false);
+    }
+  }, [dialogOpen, tip.anchorRef]);
+  const needsInstall = !installed && !pending;
+  useEffect(() => {
+    if (needsInstall) warmInstall(activeId);
+  }, [needsInstall, activeId]);
   const icons = useCustomizationStore((s) => s.gameIcons);
   const push = useNotificationStore((s) => s.push);
 
@@ -340,9 +358,9 @@ export function StartBar({ hidePlaytime = false }: { hidePlaytime?: boolean }) {
               {...tip.bind}
               onClick={onClick}
               disabled={!idle}
-              className={`start-button grid h-[46px] w-[200px] place-items-center rounded-[12px] bg-white text-[15px] font-semibold tracking-[-0.005em] text-[#111] ${
+              className={`start-button relative z-[1] grid h-[46px] w-[200px] place-items-center rounded-[12px] bg-white text-[15px] font-semibold tracking-[-0.005em] text-[#111] ${
                 idle ? "start-button-idle" : ""
-              }`}
+              } ${idle && heldRaised ? "start-button-raised" : ""}`}
             >
               <AnimatePresence initial={false}>
                 <m.span

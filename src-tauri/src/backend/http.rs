@@ -13,10 +13,20 @@ pub const USER_AGENT: &str = concat!("PeebifyLauncher/", env!("CARGO_PKG_VERSION
 
 const MAX_RETRY_DELAY_MS: u64 = 30_000;
 
+// reqwest is built without a bundled crypto provider so the launcher keeps using ring; rustls needs
+// it installed as the process default before the first client is built.
+pub fn builder() -> reqwest::ClientBuilder {
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    reqwest::Client::builder()
+}
+
 pub fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        builder()
             .timeout(HTTP_TIMEOUT)
             .tcp_nodelay(true)
             .pool_idle_timeout(Duration::from_secs(15))
@@ -29,7 +39,7 @@ pub fn client() -> &'static reqwest::Client {
 pub fn download_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        builder()
             .connect_timeout(HTTP_TIMEOUT)
             .read_timeout(HTTP_TIMEOUT)
             .no_gzip()

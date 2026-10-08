@@ -750,7 +750,7 @@ struct Session {
     audio_names: Vec<String>,
     bitrate: u32,
     rate_control: &'static str,
-    colour_tagged: bool,
+    color_tagged: bool,
     warnings: Vec<String>,
     duplicated: u64,
     decimated: u64,
@@ -923,7 +923,7 @@ impl Session {
             let attempts = candidates
                 .iter()
                 .flat_map(|codec| [(*codec, true), (*codec, false)]);
-            for (attempt, (codec, colour)) in attempts.enumerate() {
+            for (attempt, (codec, color)) in attempts.enumerate() {
                 let partial = partial_path(&path, attempt);
                 let wide: Vec<u16> = partial
                     .as_os_str()
@@ -938,17 +938,17 @@ impl Session {
                     }
                 })?;
                 let bitrate = target_bitrate(dst_w, dst_h, settings.fps, codec, &settings.quality);
-                match Self::add_video(&writer, codec, (dst_w, dst_h), settings.fps, bitrate, colour)
+                match Self::add_video(&writer, codec, (dst_w, dst_h), settings.fps, bitrate, color)
                 {
                     Ok((stream, tuned)) => {
                         pending.0 = Some(partial.clone());
-                        chosen = Some((writer, stream, codec, bitrate, tuned, colour, partial));
+                        chosen = Some((writer, stream, codec, bitrate, tuned, color, partial));
                         break;
                     }
                     Err(e) => {
-                        if colour {
+                        if color {
                             log::debug!(
-                                "recorder: the {codec} encoder refused the colour description ({e}), trying without it"
+                                "recorder: the {codec} encoder refused the color description ({e}), trying without it"
                             );
                         } else {
                             log::warn!("recorder: this machine cannot encode {codec} ({e})");
@@ -959,7 +959,7 @@ impl Session {
                     }
                 }
             }
-            let Some((writer, video_stream, codec, bitrate, tuned, colour_tagged, partial)) = chosen
+            let Some((writer, video_stream, codec, bitrate, tuned, color_tagged, partial)) = chosen
             else {
                 return Err(format!("This machine cannot encode video. {last}"));
             };
@@ -1075,7 +1075,7 @@ impl Session {
                 audio_names,
                 bitrate,
                 rate_control,
-                colour_tagged,
+                color_tagged,
                 warnings,
                 duplicated: 0,
                 decimated: 0,
@@ -1104,10 +1104,10 @@ impl Session {
             self.codec,
             self.bitrate as f64 / 1_000_000.0,
             self.rate_control,
-            if self.colour_tagged {
+            if self.color_tagged {
                 "tagged BT.709"
             } else {
-                "untagged colour"
+                "untagged color"
             },
             audio
         )
@@ -1126,7 +1126,7 @@ impl Session {
         (width, height): (u32, u32),
         fps: u32,
         bitrate: u32,
-        colour: bool,
+        color: bool,
     ) -> Result<(u32, bool), String> {
         let out = mf::create_media_type()?;
         out.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok();
@@ -1137,7 +1137,7 @@ impl Session {
         out.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             .ok();
         out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).ok();
-        if colour {
+        if color {
             tag_bt709(&out);
         }
         let stream = writer.AddStream(&out).map_err(|e| e.to_string())?;
@@ -1151,7 +1151,7 @@ impl Session {
         input
             .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
             .ok();
-        if colour {
+        if color {
             tag_bt709(&input);
         }
 

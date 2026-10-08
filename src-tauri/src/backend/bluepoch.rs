@@ -159,7 +159,7 @@ impl ApiConfig {
 fn api_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        http::builder()
             .connect_timeout(API_CONNECT_TIMEOUT)
             .timeout(API_TIMEOUT)
             .tcp_nodelay(true)
